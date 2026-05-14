@@ -11,6 +11,13 @@ request-changes / comment) back to GitHub.
 
 All tool data lives under `~/.spectrabot/`.
 
+> **Looking for the interactive `/pr-review` slash command?**
+> [`pr-review.md`](pr-review.md) is the canonical, tool-agnostic review spec.
+> [`integrations/`](integrations/) holds drop-in wrappers for Claude Code,
+> Codex, and OpenCode — all generated from the canonical by
+> [`scripts/sync-integrations.sh`](scripts/sync-integrations.sh). See
+> [`integrations/README.md`](integrations/README.md) for install steps.
+
 ---
 
 ## 1. Prerequisites
@@ -164,6 +171,27 @@ The review prompt lives at `~/.spectrabot/lib/review_prompt.md` after install.
 Edit it in place to change tone or what the model focuses on. Reinstalling
 overwrites it, so keep edits in this repo's `lib/review_prompt.md` if you want
 them to survive `./install.sh`.
+
+### Review verdict and severity rubric
+
+`lib/review_prompt.md` asks the model to assign each inline comment one of
+five severities (`blocker` / `critical` / `high` / `medium` / `nitpick`) and
+derive the top-level `recommendation` mechanically:
+
+- Any **blocker** → `request-changes`
+- No blockers, any **critical** → `request-changes`
+- Otherwise → `approve` (or `comment` if there are only open questions)
+
+`scan.py` then maps `recommendation` to a GitHub review event via the `mode`
+setting above. The `counts` and per-comment `severity` fields in the JSON
+output are surfaced in the review body and inline comments — `scan.py` reads
+the existing `recommendation` / `summary` / `inline_comments` keys and ignores
+the extras, so the contract is additive.
+
+The same rubric drives the interactive [`pr-review.md`](pr-review.md) spec
+used by the slash command. Edit the canonical there to keep the
+human-readable template in sync with the bot's behavior, then run
+`./scripts/sync-integrations.sh` to regenerate the per-tool wrappers.
 
 ---
 
@@ -352,7 +380,14 @@ Source repo:
 spectrabot/
 ├── bin/spectrabot                    # entry point (installed to ~/.spectrabot/bin/)
 ├── lib/scan.py                       # main scanner
-├── lib/review_prompt.md              # prompt fed to claude -p
+├── lib/review_prompt.md              # prompt fed to claude -p (headless bot)
+├── pr-review.md                      # canonical interactive review spec
+├── integrations/                     # generated /pr-review slash commands
+│   ├── README.md
+│   ├── claude-code/{prefix.md,commands/pr-review.md}
+│   ├── codex/{prefix.md,prompts/pr-review.md}
+│   └── opencode/{prefix.md,command/pr-review.md}
+├── scripts/sync-integrations.sh      # regenerates integrations/ from pr-review.md
 ├── config/config.example.toml        # template config
 ├── service/spectrabot.service        # systemd oneshot
 ├── service/spectrabot.timer          # systemd timer
@@ -360,6 +395,11 @@ spectrabot/
 ├── install.sh
 └── uninstall.sh
 ```
+
+`install.sh` only installs the headless service (`bin/`, `lib/`, `service/`,
+`config/`). The interactive slash command lives entirely in `integrations/` —
+symlink the wrapper for your tool into its expected path (see
+[`integrations/README.md`](integrations/README.md)).
 
 Installed layout (target machine):
 
