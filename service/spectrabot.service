@@ -1,0 +1,19 @@
+[Unit]
+Description=SpectraBot — scan configured GitHub repos for PRs and review them with Claude
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# PATH must include where `gh`, `claude`, and `python3` live for the user.
+Environment="PATH=%h/.local/bin:%h/.pyenv/shims:/usr/local/bin:/usr/bin:/bin"
+Environment="SPECTRABOT_HOME=%h/.spectrabot"
+ExecStart=%h/.spectrabot/bin/spectrabot
+# Don't keep the service in "failed" state on transient errors — the timer
+# will fire again. Per-PR failures are already caught inside scan.py.
+SuccessExitStatus=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

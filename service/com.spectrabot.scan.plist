@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.spectrabot.scan</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.spectrabot/bin/spectrabot</string>
+  </array>
+
+  <!-- Fire every 10 minutes. -->
+  <key>StartInterval</key>
+  <integer>600</integer>
+
+  <!-- Also fire shortly after login. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- launchd starts agents with a minimal PATH; extend it so `gh`,
+       `claude`, and `python3` resolve. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>SPECTRABOT_HOME</key>
+    <string>__HOME__/.spectrabot</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.spectrabot/logs/scan.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.spectrabot/logs/scan.log</string>
+
+  <!-- Don't relaunch on failure; the next interval will handle it. -->
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>

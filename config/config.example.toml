@@ -1,0 +1,38 @@
+# SpectraBot configuration
+# Installed location: ~/.spectrabot/config.toml
+
+[github]
+# Repos to scan, "owner/repo" format.
+repos = [
+  # "octocat/hello-world",
+]
+
+[review]
+# How to translate the model's recommendation into a GitHub review event.
+#   "auto"    = approve / request-changes / comment based on the verdict
+#   "comment" = always file as comment-only regardless of verdict
+mode = "auto"
+
+# GitHub usernames whose PRs should be skipped (bots, etc).
+# Note: GitHub blocks approving your own PR, so when you authored a PR
+# SpectraBot automatically downgrades the event to COMMENT even in "auto" mode.
+skip_authors = []
+
+# Hard cap on PRs reviewed in a single scan. Protects against runaway token
+# spend if many PRs land at once. Set to 0 for no cap.
+max_prs_per_scan = 10
+
+# If the unified diff exceeds this many lines, skip the PR (too large to
+# review meaningfully in one shot). 0 = no limit.
+max_diff_lines = 4000
+
+[claude]
+# Path to the claude CLI. Leave empty to use whatever's on PATH.
+bin = ""
+
+# Extra args appended to the `claude -p ...` invocation.
+# Example: extra_args = ["--model", "claude-sonnet-4-6"]
+extra_args = []
+
+# Per-PR timeout in seconds.
+timeout_seconds = 600

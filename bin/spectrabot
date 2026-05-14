@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SpectraBot entry point. Locates the installed lib and runs scan.py.
+set -euo pipefail
+
+SPECTRABOT_HOME="${SPECTRABOT_HOME:-$HOME/.spectrabot}"
+LIB_DIR="${SPECTRABOT_LIB:-$SPECTRABOT_HOME/lib}"
+
+if [[ ! -f "$LIB_DIR/scan.py" ]]; then
+  echo "spectrabot: scan.py not found under $LIB_DIR" >&2
+  echo "Run install.sh, or set SPECTRABOT_LIB to the lib/ dir of a source checkout." >&2
+  exit 1
+fi
+
+export SPECTRABOT_HOME
+exec python3 "$LIB_DIR/scan.py" "$@"
