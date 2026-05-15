@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.request
@@ -112,7 +113,7 @@ def fetch_chuck_norris_joke() -> str | None:
             f"{CHUCK_NORRIS_API}?category={category}",
             headers={"Accept": "application/json", "User-Agent": "SpectraBot/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read().decode())
         return (data.get("value") or "").strip() or None
     except Exception as e:
@@ -121,9 +122,19 @@ def fetch_chuck_norris_joke() -> str | None:
 
 
 def celebrate_approval(pr_id: str) -> None:
-    joke = fetch_chuck_norris_joke()
-    if joke:
-        log(f"[{pr_id}] Chuck Norris says: {joke}", level="joke")
+    """Fetch and log a celebratory joke without blocking the caller.
+
+    The fetch runs on a background daemon thread so a slow or unreachable
+    joke API never adds latency to the scan loop, and a scan that finishes
+    while a fetch is still in flight does not hang the process.
+    """
+
+    def _run() -> None:
+        joke = fetch_chuck_norris_joke()
+        if joke:
+            log(f"[{pr_id}] Chuck Norris says: {joke}", level="joke")
+
+    threading.Thread(target=_run, daemon=True, name="celebrate-approval").start()
 
 
 def load_config() -> dict:
