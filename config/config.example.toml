@@ -26,12 +26,16 @@ max_prs_per_scan = 10
 # review meaningfully in one shot). 0 = no limit.
 max_diff_lines = 4000
 
-[claude]
-# Path to the claude CLI. Leave empty to use whatever's on PATH.
+[engine]
+# Which agent CLI runs the review. One of: "claude", "codex", "opencode".
+# Each engine needs its own auth configured separately.
+name = "claude"
+
+# Path to the engine CLI. Leave empty to look `name` up on PATH.
 bin = ""
 
-# Extra args appended to the `claude -p ...` invocation.
-# Example: extra_args = ["--model", "claude-sonnet-4-6"]
+# Extra args appended to the engine invocation.
+# Example (claude): extra_args = ["--model", "claude-sonnet-4-6"]
 extra_args = []
 
 # Per-PR timeout in seconds.

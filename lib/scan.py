@@ -187,8 +187,17 @@ def fetch_pr_context(repo: str, pr_number: int) -> tuple[dict, str]:
     return meta, diff
 
 
-def parse_claude_output(text: str) -> dict:
-    """Pull the JSON block out of Claude's response."""
+# Non-interactive invocation shape per supported engine CLI. The review prompt
+# is passed as a single argv element between `before` and `after`.
+ENGINE_SPECS = {
+    "claude": {"before": ["-p"], "after": ["--output-format", "text"]},
+    "codex": {"before": ["exec"], "after": []},
+    "opencode": {"before": ["run"], "after": []},
+}
+
+
+def parse_review_output(text: str) -> dict:
+    """Pull the JSON block out of the engine's response."""
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
         return json.loads(m.group(1))
@@ -196,25 +205,32 @@ def parse_claude_output(text: str) -> dict:
     end = text.rfind("}")
     if start != -1 and end > start:
         return json.loads(text[start : end + 1])
-    raise ValueError(f"no JSON object in claude output (first 500 chars): {text[:500]}")
+    raise ValueError(f"no JSON object in engine output (first 500 chars): {text[:500]}")
 
 
-def invoke_claude(prompt_text: str, pr_meta: dict, diff: str, cfg: dict) -> dict:
+def invoke_engine(prompt_text: str, pr_meta: dict, diff: str, cfg: dict) -> dict:
     user_prompt = (
         f"{prompt_text}\n\n"
         f"## PR Metadata\n```json\n{json.dumps(pr_meta, indent=2)}\n```\n\n"
         f"## Unified Diff\n```diff\n{diff}\n```\n"
     )
-    claude_bin = cfg.get("claude", {}).get("bin") or shutil.which("claude") or "claude"
-    extra_args = cfg.get("claude", {}).get("extra_args", [])
-    timeout = cfg.get("claude", {}).get("timeout_seconds", 600)
-    cmd = [claude_bin, "-p", user_prompt, "--output-format", "text", *extra_args]
+    eng = cfg.get("engine", {})
+    name = eng.get("name", "claude")
+    spec = ENGINE_SPECS.get(name)
+    if spec is None:
+        raise RuntimeError(
+            f"unknown engine {name!r}; valid: {', '.join(sorted(ENGINE_SPECS))}"
+        )
+    engine_bin = eng.get("bin") or shutil.which(name) or name
+    extra_args = eng.get("extra_args", [])
+    timeout = eng.get("timeout_seconds", 600)
+    cmd = [engine_bin, *spec["before"], user_prompt, *spec["after"], *extra_args]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if res.returncode != 0:
         raise RuntimeError(
-            f"claude exit {res.returncode}: {res.stderr.strip()[:500]}"
+            f"{name} exit {res.returncode}: {res.stderr.strip()[:500]}"
         )
-    return parse_claude_output(res.stdout)
+    return parse_review_output(res.stdout)
 
 
 def decide_event(recommendation: str, is_own_pr: bool, mode: str) -> str:
@@ -415,7 +431,7 @@ def review_one_pr(
     if max_diff and diff_lines > max_diff:
         raise RuntimeError(f"diff too large ({diff_lines} > {max_diff} lines)")
 
-    review = invoke_claude(prompt_text, meta, diff, cfg)
+    review = invoke_engine(prompt_text, meta, diff, cfg)
     mode = cfg.get("review", {}).get("mode", "auto")
     verdict = review.get("recommendation", "comment")
     event = decide_event(verdict, is_own, mode)

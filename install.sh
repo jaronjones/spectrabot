@@ -32,7 +32,15 @@ need_cmd() {
 }
 need_cmd python3
 need_cmd gh
-need_cmd claude
+
+# The review engine is chosen in config.toml (claude / codex / opencode),
+# which doesn't exist yet at preflight — so warn rather than fail.
+if ! command -v claude >/dev/null 2>&1 \
+   && ! command -v codex >/dev/null 2>&1 \
+   && ! command -v opencode >/dev/null 2>&1; then
+  echo "WARNING: no review engine found on PATH (claude / codex / opencode)." >&2
+  echo "         Install the one you set as \`[engine] name\` before the first scan." >&2
+fi
 
 PY_MAJOR_MINOR="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then

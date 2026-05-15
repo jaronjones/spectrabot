@@ -1,10 +1,10 @@
 # SpectraBot
 
 Background service that scans a configured list of GitHub repos for open PRs,
-reviews each one with headless Claude Code, and posts the review (approve /
+reviews each one with a headless coding agent, and posts the review (approve /
 request-changes / comment) back to GitHub.
 
-- **Review engine:** `claude -p` (headless Claude Code) with full repo-read access
+- **Review engine:** a headless agent CLI — `claude`, `codex`, or `opencode`, selected in config
 - **Posting:** as your own GitHub user, via the `gh` CLI
 - **Schedule:** `systemd --user` timer on Linux, `launchd` agent on macOS
 - **State:** each PR is reviewed at most once (tracked in a JSON state file)
@@ -26,7 +26,7 @@ All tool data lives under `~/.spectrabot/`.
 |-----------|--------------------------------------|--------------------------------------|
 | Python ≥ 3.11 | runs `scan.py` (needs stdlib `tomllib`) | `python3 -c 'import tomllib'` |
 | `gh`      | lists PRs and posts reviews          | `gh --version`                       |
-| `claude`  | generates the review                 | `claude --version`                   |
+| review engine | generates the review — one of `claude`, `codex`, `opencode` (see `[engine]` in config) | `<engine> --version` |
 
 ### GitHub auth and scopes
 
@@ -42,10 +42,13 @@ gh auth status                 # confirm it picked up the new scope
 For repos in organizations with SSO, you'll also need to authorize the token
 for that org (GitHub prompts you the first time `gh` is denied).
 
-### Claude auth
+### Review engine auth
 
-`claude` reads its own credentials from `~/.claude/`. If you can run
-`claude -p "hi"` from a normal terminal and get a reply, SpectraBot can too.
+SpectraBot drives whichever engine you set as `[engine] name` — `claude`,
+`codex`, or `opencode`. Each authenticates independently (e.g. `claude` reads
+`~/.claude/`; `codex` and `opencode` have their own logins). If you can run the
+engine non-interactively from a normal terminal and get a reply, SpectraBot
+can too.
 
 ---
 
@@ -143,14 +146,23 @@ max_prs_per_scan = 10
 # meaningfully in one shot). 0 disables the limit.
 max_diff_lines = 4000
 
-[claude]
-# Optional: pin a specific claude binary. Empty = use PATH.
+[engine]
+# Which agent CLI runs the review: "claude", "codex", or "opencode".
+name = "claude"
+# Optional: pin a specific engine binary. Empty = look `name` up on PATH.
 bin = ""
-# Optional: extra args appended to `claude -p ...`, e.g. ["--model", "claude-sonnet-4-6"].
+# Optional: extra args appended to the engine invocation,
+# e.g. (claude) ["--model", "claude-sonnet-4-6"].
 extra_args = []
 # Per-PR timeout in seconds.
 timeout_seconds = 600
 ```
+
+The engine is invoked non-interactively per PR: `claude -p <prompt>`,
+`codex exec <prompt>`, or `opencode run <prompt>`. The review prompt is
+identical across engines; only the JSON block in the engine's stdout is
+consumed, so incidental log output is tolerated. If a new engine emits noisy
+stdout that confuses parsing, use `extra_args` to quiet it.
 
 A PR is reviewed when **all** of these are true:
 
