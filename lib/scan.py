@@ -364,8 +364,10 @@ def previously_reviewed_action(
         return "rescan" if head_changed else "skip"
 
     if verdict not in ("request-changes", "comment"):
-        # "approve" should be filtered upstream via reviewDecision; be defensive.
-        return "skip"
+        # Previously approved (or an unexpected verdict). Re-review only when
+        # new commits have landed since — an unchanged head has nothing left
+        # to re-evaluate.
+        return "rescan" if head_changed else "skip"
 
     if not inline_count:
         return "rescan" if head_changed else "skip"
