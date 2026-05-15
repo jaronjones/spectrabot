@@ -67,7 +67,7 @@ def log(msg: str, level: str = "info") -> None:
 
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(_log_file(), "a") as f:
+        with open(_log_file(), "a", encoding="utf-8") as f:
             f.write(plain + "\n")
     except OSError as e:
         print(f"{ts} WARN  log file write failed: {e}", flush=True)
