@@ -360,8 +360,20 @@ def invoke_engine(prompt_text: str, pr_meta: dict, diff: str, cfg: dict) -> dict
     return parse_review_output(res.stdout)
 
 
-def decide_event(recommendation: str, is_own_pr: bool, mode: str) -> str:
-    if mode == "comment" or is_own_pr:
+def decide_event(
+    recommendation: str, reviewer_login: str, pr_author: str, mode: str
+) -> str:
+    """Map the engine's recommendation to a GitHub review event.
+
+    The review is posted by `reviewer_login` — the developer chosen by
+    `select_reviewer`, or the ambient `gh` identity when no developers are
+    configured. A reviewer who is not the PR author may APPROVE. When the
+    reviewer *is* the PR author (the author-fallback case, or an ambient
+    single-user setup reviewing its own PR) the event is forced to COMMENT so
+    no one approves their own PR. `mode == "comment"` forces COMMENT for every
+    PR regardless of verdict.
+    """
+    if mode == "comment" or reviewer_login == pr_author:
         return "COMMENT"
     if recommendation == "approve":
         return "APPROVE"
@@ -521,13 +533,21 @@ def approve_resolved_pr(
     repo: str,
     pr_number: int,
     head_sha: str,
-    is_own_pr: bool,
+    reviewer_login: str,
+    pr_author: str,
     mode: str,
     dry_run: bool,
 ) -> str:
     """Post a re-review for a PR whose prior SpectraBot comments are resolved
-    or outdated. Returns the GitHub event used ("APPROVE" or "COMMENT")."""
-    event = "COMMENT" if (mode == "comment" or is_own_pr) else "APPROVE"
+    or outdated. Returns the GitHub event used ("APPROVE" or "COMMENT").
+
+    Downgrades to COMMENT when the selected reviewer is the PR author so no one
+    approves their own PR — the same rule `decide_event` applies."""
+    event = (
+        "COMMENT"
+        if (mode == "comment" or reviewer_login == pr_author)
+        else "APPROVE"
+    )
     verb = "Approving" if event == "APPROVE" else "Acknowledging resolution"
     body = (
         f"Previously raised comments are resolved or outdated. {verb}.\n\n"
@@ -548,12 +568,11 @@ def review_one_pr(
     pr: dict,
     prompt_text: str,
     cfg: dict,
-    viewer: str,
+    reviewer_login: str,
     dry_run: bool,
 ) -> dict:
     pr_number = pr["number"]
     head_sha = pr["headRefOid"]
-    is_own = pr["author"]["login"] == viewer
     meta, diff = fetch_pr_context(repo, pr_number)
 
     max_diff = cfg.get("review", {}).get("max_diff_lines", 4000)
@@ -564,7 +583,7 @@ def review_one_pr(
     review = invoke_engine(prompt_text, meta, diff, cfg)
     mode = cfg.get("review", {}).get("mode", "auto")
     verdict = review.get("recommendation", "comment")
-    event = decide_event(verdict, is_own, mode)
+    event = decide_event(verdict, reviewer_login, pr["author"]["login"], mode)
     payload = build_review_payload(review, head_sha, event)
     inline_count = len(payload.get("comments", []))
 
@@ -657,9 +676,8 @@ def main() -> int:
                 log(f"[{pr_id}] skip: max_prs_per_scan ({max_prs}) reached")
                 continue
 
-            # Decide who would post this PR's review. The result is consumed by
-            # the event-decision and posting work in later stories; for now it
-            # is logged so the chosen reviewer is visible per PR.
+            # Decide who would post this PR's review. The event decision below
+            # is made against this selected reviewer, not a single global user.
             selection = select_reviewer(pr, developers)
             reviewer_login = (
                 selection["developer"]["login"]
@@ -674,13 +692,22 @@ def main() -> int:
             else:
                 log(f"[{pr_id}] selected reviewer: {reviewer_login}")
 
+            # The only eligible reviewer is the PR author and the operator
+            # chose to skip rather than downgrade to COMMENT.
+            if selection["kind"] == "author_fallback" and author_fallback == "skip":
+                log(
+                    f"[{pr_id}] skip: only configured developer is the PR "
+                    "author and review.author_fallback is 'skip'"
+                )
+                continue
+
             if action == "approve":
                 log(f"[{pr_id}] prior comments resolved — approving")
                 try:
                     mode = cfg.get("review", {}).get("mode", "auto")
-                    is_own = pr["author"]["login"] == viewer
                     event = approve_resolved_pr(
-                        repo, pr["number"], pr["headRefOid"], is_own, mode, args.dry_run
+                        repo, pr["number"], pr["headRefOid"], reviewer_login,
+                        pr["author"]["login"], mode, args.dry_run
                     )
                     if not args.dry_run:
                         state[pr_id] = {
@@ -701,7 +728,9 @@ def main() -> int:
 
             log(f"[{pr_id}] reviewing @ {pr['headRefOid'][:8]}: {pr['title']}")
             try:
-                result = review_one_pr(repo, pr, prompt_text, cfg, viewer, args.dry_run)
+                result = review_one_pr(
+                    repo, pr, prompt_text, cfg, reviewer_login, args.dry_run
+                )
                 if not args.dry_run:
                     state[pr_id] = {
                         "head_sha": pr["headRefOid"],

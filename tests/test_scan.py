@@ -230,5 +230,48 @@ class SelectReviewerTest(unittest.TestCase):
         self.assertEqual(result["developer"]["login"], "alice")
 
 
+class DecideEventTest(unittest.TestCase):
+    """decide_event decides the GitHub event against the *selected reviewer*,
+    not a single global viewer."""
+
+    def test_non_author_reviewer_maps_verdict_normally(self):
+        """An eligible non-author reviewer may APPROVE."""
+        self.assertEqual(
+            scan.decide_event("approve", "alice", "carol", "auto"), "APPROVE"
+        )
+        self.assertEqual(
+            scan.decide_event("request-changes", "alice", "carol", "auto"),
+            "REQUEST_CHANGES",
+        )
+        self.assertEqual(
+            scan.decide_event("comment", "alice", "carol", "auto"), "COMMENT"
+        )
+
+    def test_unknown_verdict_falls_back_to_comment(self):
+        self.assertEqual(
+            scan.decide_event("???", "alice", "carol", "auto"), "COMMENT"
+        )
+
+    def test_reviewer_is_author_forced_to_comment(self):
+        """Author-fallback / ambient self-review: reviewer == author, so the
+        verdict is downgraded to COMMENT regardless of recommendation."""
+        self.assertEqual(
+            scan.decide_event("approve", "alice", "alice", "auto"), "COMMENT"
+        )
+        self.assertEqual(
+            scan.decide_event("request-changes", "alice", "alice", "auto"),
+            "COMMENT",
+        )
+
+    def test_comment_mode_forces_comment_for_all_prs(self):
+        self.assertEqual(
+            scan.decide_event("approve", "alice", "carol", "comment"), "COMMENT"
+        )
+        self.assertEqual(
+            scan.decide_event("request-changes", "alice", "carol", "comment"),
+            "COMMENT",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
