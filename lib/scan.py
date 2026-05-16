@@ -478,11 +478,14 @@ def post_review(repo: str, pr_number: int, payload: dict, token: str | None = No
 
 
 def fetch_spectrabot_threads(
-    repo: str, pr_number: int, viewer: str, token: str | None = None
+    repo: str, pr_number: int, logins: set[str], token: str | None = None
 ) -> list[dict]:
     """Return the review threads on a PR whose first comment was authored by
-    `viewer` (i.e. SpectraBot's own threads). Each item is
-    {"resolved": bool, "outdated": bool}."""
+    any of `logins` (i.e. SpectraBot's own threads).
+
+    `logins` is the set of configured developer logins — any of them may have
+    posted a prior review — or the ambient `gh` identity when no developers
+    are configured. Each item is {"resolved": bool, "outdated": bool}."""
     owner, name = repo.split("/", 1)
     query = (
         "query($owner:String!,$name:String!,$number:Int!){"
@@ -514,7 +517,7 @@ def fetch_spectrabot_threads(
         if not comments:
             continue
         author = (comments[0].get("author") or {}).get("login")
-        if author != viewer:
+        if author not in logins:
             continue
         threads.append({
             "resolved": bool(t.get("isResolved")),
@@ -524,9 +527,13 @@ def fetch_spectrabot_threads(
 
 
 def previously_reviewed_action(
-    repo: str, pr: dict, state_entry: dict, viewer: str, token: str | None = None
+    repo: str, pr: dict, state_entry: dict, logins: set[str],
+    token: str | None = None,
 ) -> str:
     """For a PR already in state, decide whether to skip, approve, or rescan.
+
+    `logins` is the set of identities whose review threads count as
+    SpectraBot's own (see `fetch_spectrabot_threads`).
 
     Returns "skip" | "approve" | "rescan".
     """
@@ -546,7 +553,7 @@ def previously_reviewed_action(
         return "rescan" if head_changed else "skip"
 
     try:
-        threads = fetch_spectrabot_threads(repo, pr["number"], viewer, token=token)
+        threads = fetch_spectrabot_threads(repo, pr["number"], logins, token=token)
     except Exception as e:
         log(f"  graphql fetch failed; treating as unresolved: {e}", level="warn")
         return "rescan" if head_changed else "skip"
@@ -566,16 +573,22 @@ def approve_resolved_pr(
     repo: str,
     pr_number: int,
     head_sha: str,
-    reviewer_login: str,
+    candidates: list[dict],
     pr_author: str,
     mode: str,
     dry_run: bool,
-) -> str:
+) -> dict:
     """Post a re-review for a PR whose prior SpectraBot comments are resolved
-    or outdated. Returns the GitHub event used ("APPROVE" or "COMMENT").
+    or outdated. Returns {"event": str, "reviewer": str} — the GitHub event
+    used ("APPROVE" or "COMMENT") and the login that actually posted.
 
+    `candidates` is the ordered list from `reviewer_candidates`: the re-review
+    posts under the first candidate's token, falling through to the next when
+    posting fails (revoked token, lost repo scope) and failing the PR only
+    when every candidate fails — the same fall-through `review_one_pr` applies.
     Downgrades to COMMENT when the selected reviewer is the PR author so no one
     approves their own PR — the same rule `decide_event` applies."""
+    reviewer_login = candidates[0]["login"]
     event = (
         "COMMENT"
         if (mode == "comment" or reviewer_login == pr_author)
@@ -588,12 +601,32 @@ def approve_resolved_pr(
     )
     payload = {"commit_id": head_sha, "event": event, "body": body}
     if dry_run:
-        log(f"  [dry-run] would POST review:\n{json.dumps(payload, indent=2)}")
-        return event
-    post_review(repo, pr_number, payload)
-    if event == "APPROVE":
-        celebrate_approval(f"{repo}#{pr_number}")
-    return event
+        log(
+            f"  [dry-run] would post review as {reviewer_login}:\n"
+            f"{json.dumps(payload, indent=2)}"
+        )
+        return {"event": event, "reviewer": reviewer_login}
+
+    errors = []
+    for candidate in candidates:
+        try:
+            post_review(repo, pr_number, payload, token=candidate["token"])
+        except Exception as e:
+            errors.append(f"{candidate['login']}: {e}")
+            log(
+                f"  posting as {candidate['login']} failed; "
+                f"trying next eligible developer: {e}",
+                level="warn",
+            )
+            continue
+        if event == "APPROVE":
+            celebrate_approval(f"{repo}#{pr_number}")
+        return {"event": event, "reviewer": candidate["login"]}
+
+    raise RuntimeError(
+        "every eligible developer failed to post the re-review "
+        f"({'; '.join(errors)})"
+    )
 
 
 def review_one_pr(
@@ -710,6 +743,11 @@ def main() -> int:
     except subprocess.CalledProcessError as e:
         sys.exit(f"`gh` not authenticated? {e}")
 
+    # Logins whose prior review threads count as SpectraBot's own — any
+    # configured developer may have posted an earlier review, or the ambient
+    # `gh` identity when no developers are configured.
+    reviewer_logins = {dev["login"] for dev in developers} or {viewer}
+
     repos = [args.repo] if args.repo else cfg.get("github", {}).get("repos", [])
     if not repos:
         log("no repos configured; nothing to do")
@@ -740,7 +778,7 @@ def main() -> int:
             action = "review"
             if not args.force and pr_id in state:
                 action = previously_reviewed_action(
-                    repo, pr, state[pr_id], viewer, token=read_token
+                    repo, pr, state[pr_id], reviewer_logins, token=read_token
                 )
 
             if action == "skip":
@@ -777,17 +815,18 @@ def main() -> int:
                 log(f"[{pr_id}] prior comments resolved — approving")
                 try:
                     mode = cfg.get("review", {}).get("mode", "auto")
-                    event = approve_resolved_pr(
-                        repo, pr["number"], pr["headRefOid"], reviewer_login,
+                    result = approve_resolved_pr(
+                        repo, pr["number"], pr["headRefOid"], candidates,
                         pr["author"]["login"], mode, args.dry_run
                     )
+                    event = result["event"]
                     if not args.dry_run:
                         state[pr_id] = {
                             **state[pr_id],
                             "head_sha": pr["headRefOid"],
                             "reviewed_at": datetime.now(timezone.utc).isoformat(),
                             "verdict": "approve" if event == "APPROVE" else state[pr_id].get("verdict"),
-                            "reviewer": reviewer_login,
+                            "reviewer": result["reviewer"],
                         }
                         save_state(state)
                     reviewed_this_run += 1

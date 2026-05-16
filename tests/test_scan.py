@@ -402,5 +402,174 @@ class ReviewOnePrTest(unittest.TestCase):
         self.assertEqual(result["reviewer"], "alice")
 
 
+class FetchSpectrabotThreadsTest(unittest.TestCase):
+    """fetch_spectrabot_threads matches threads opened by any configured
+    developer login, not a single viewer."""
+
+    @staticmethod
+    def _graphql(thread_authors):
+        """Build a graphql response whose review threads' first comments are
+        authored by the given logins. `thread_authors` is a list of
+        (login, isResolved, isOutdated) tuples."""
+        nodes = [
+            {
+                "isResolved": resolved,
+                "isOutdated": outdated,
+                "comments": {"nodes": [{"author": {"login": login}}]},
+            }
+            for login, resolved, outdated in thread_authors
+        ]
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {"reviewThreads": {"nodes": nodes}}
+                }
+            }
+        }
+
+    def test_matches_any_configured_developer_login(self):
+        response = self._graphql([
+            ("alice", True, False),
+            ("bob", False, False),
+            ("carol", False, False),  # PR author, not a developer
+        ])
+        with mock.patch.object(scan, "gh_json", return_value=response):
+            threads = scan.fetch_spectrabot_threads(
+                "owner/repo", 1, {"alice", "bob"}
+            )
+        self.assertEqual(
+            threads,
+            [
+                {"resolved": True, "outdated": False},
+                {"resolved": False, "outdated": False},
+            ],
+        )
+
+    def test_ignores_threads_from_unknown_authors(self):
+        response = self._graphql([("stranger", True, False)])
+        with mock.patch.object(scan, "gh_json", return_value=response):
+            threads = scan.fetch_spectrabot_threads(
+                "owner/repo", 1, {"alice", "bob"}
+            )
+        self.assertEqual(threads, [])
+
+    def test_forwards_read_token(self):
+        with mock.patch.object(scan, "gh_json", return_value={}) as gj:
+            scan.fetch_spectrabot_threads(
+                "owner/repo", 1, {"alice"}, token="t-read"
+            )
+        self.assertEqual(gj.call_args.kwargs.get("token"), "t-read")
+
+
+class PreviouslyReviewedActionTest(unittest.TestCase):
+    PR = {"number": 5, "headRefOid": "sha-new"}
+
+    def test_resolved_threads_yield_approve(self):
+        entry = {
+            "head_sha": "sha-old",
+            "verdict": "request-changes",
+            "inline_comment_count": 2,
+        }
+        with mock.patch.object(
+            scan, "fetch_spectrabot_threads",
+            return_value=[{"resolved": True, "outdated": False}],
+        ) as ft:
+            action = scan.previously_reviewed_action(
+                "owner/repo", self.PR, entry, {"alice", "bob"}, token="t-read"
+            )
+        self.assertEqual(action, "approve")
+        # The configured developer logins are threaded through unchanged.
+        self.assertEqual(ft.call_args.args[2], {"alice", "bob"})
+        self.assertEqual(ft.call_args.kwargs.get("token"), "t-read")
+
+    def test_unresolved_threads_with_advanced_head_yield_rescan(self):
+        entry = {
+            "head_sha": "sha-old",
+            "verdict": "request-changes",
+            "inline_comment_count": 1,
+        }
+        with mock.patch.object(
+            scan, "fetch_spectrabot_threads",
+            return_value=[{"resolved": False, "outdated": False}],
+        ):
+            action = scan.previously_reviewed_action(
+                "owner/repo", self.PR, entry, {"alice"}
+            )
+        self.assertEqual(action, "rescan")
+
+
+class ApproveResolvedPrTest(unittest.TestCase):
+    def test_posts_with_first_candidate_token_and_approves(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        with mock.patch.object(scan, "post_review") as posted, \
+                mock.patch.object(scan, "celebrate_approval"):
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "carol", "auto", False
+            )
+        self.assertEqual(result, {"event": "APPROVE", "reviewer": "alice"})
+        self.assertEqual(posted.call_args.kwargs["token"], "t-alice")
+
+    def test_author_fallback_downgrades_to_comment(self):
+        """When the only candidate is the PR author, the event is COMMENT."""
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        with mock.patch.object(scan, "post_review"):
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "alice", "auto", False
+            )
+        self.assertEqual(result["event"], "COMMENT")
+        self.assertEqual(result["reviewer"], "alice")
+
+    def test_comment_mode_forces_comment(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        with mock.patch.object(scan, "post_review"):
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "carol", "comment", False
+            )
+        self.assertEqual(result["event"], "COMMENT")
+
+    def test_falls_through_to_next_developer_on_posting_failure(self):
+        candidates = [
+            {"login": "alice", "token": "t-alice"},
+            {"login": "bob", "token": "t-bob"},
+        ]
+        with mock.patch.object(
+            scan, "post_review",
+            side_effect=[RuntimeError("revoked token"), None],
+        ) as posted, mock.patch.object(scan, "celebrate_approval"):
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "carol", "auto", False
+            )
+        self.assertEqual(result["reviewer"], "bob")
+        self.assertEqual(
+            [c.kwargs["token"] for c in posted.call_args_list],
+            ["t-alice", "t-bob"],
+        )
+
+    def test_fails_only_when_every_candidate_fails(self):
+        candidates = [
+            {"login": "alice", "token": "t-alice"},
+            {"login": "bob", "token": "t-bob"},
+        ]
+        with mock.patch.object(
+            scan, "post_review",
+            side_effect=[RuntimeError("alice bad"), RuntimeError("bob bad")],
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                scan.approve_resolved_pr(
+                    "owner/repo", 9, "sha", candidates, "carol", "auto", False
+                )
+        self.assertIn("alice", str(ctx.exception))
+        self.assertIn("bob", str(ctx.exception))
+
+    def test_dry_run_posts_nothing_and_records_first_candidate(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        with mock.patch.object(scan, "post_review") as posted:
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "carol", "auto", True
+            )
+        posted.assert_not_called()
+        self.assertEqual(result, {"event": "APPROVE", "reviewer": "alice"})
+
+
 if __name__ == "__main__":
     unittest.main()
