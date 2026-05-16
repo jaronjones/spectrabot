@@ -5,9 +5,9 @@ reviews each one with a headless coding agent, and posts the review (approve /
 request-changes / comment) back to GitHub.
 
 - **Review engine:** a headless agent CLI — `claude`, `codex`, or `opencode`, selected in config
-- **Posting:** as your own GitHub user, via the `gh` CLI
+- **Posting:** as a configured developer who is *not* the PR author (so no one reviews their own PR), via the `gh` CLI — or as your own ambient `gh` user if no developers are configured
 - **Schedule:** `systemd --user` timer on Linux, `launchd` agent on macOS
-- **State:** each PR is reviewed at most once (tracked in a JSON state file)
+- **State:** each PR is reviewed at most once, and the state file records which developer posted that review
 
 All tool data lives under `~/.spectrabot/`.
 
@@ -30,7 +30,7 @@ All tool data lives under `~/.spectrabot/`.
 
 ### GitHub auth and scopes
 
-SpectraBot posts reviews as your user, so `gh` needs PR write scope on the
+SpectraBot posts reviews via the `gh` CLI, so `gh` needs PR write scope on the
 repos you point it at:
 
 ```sh
@@ -41,6 +41,12 @@ gh auth status                 # confirm it picked up the new scope
 
 For repos in organizations with SSO, you'll also need to authorize the token
 for that org (GitHub prompts you the first time `gh` is denied).
+
+If you configure per-developer tokens (`[[github.developers]]`) or a
+`self_token` override — see [section 3](#3-configure) — the same applies to
+**each** of those tokens: every developer token and `self_token` needs `repo`
+scope, plus SSO authorization for any SSO-protected org it will post in.
+Ambient `gh auth` only covers the single-user fallback.
 
 ### Review engine auth
 
@@ -130,6 +136,18 @@ repos = [
   "myorg/web-app",
 ]
 
+# Optional: developer credentials SpectraBot can post reviews as. Each PR is
+# reviewed by the first developer in this list whose login is NOT the PR
+# author ("first eligible, not the author"), so no one reviews their own PR.
+# List your team in the order you want them tried.
+[[github.developers]]
+login = "alice"
+token = "ghp_REPLACE_ME_ALICE"
+
+[[github.developers]]
+login = "bob"
+token = "ghp_REPLACE_ME_BOB"
+
 [review]
 # "auto"    — map verdict to APPROVE / REQUEST_CHANGES / COMMENT
 # "comment" — always file as COMMENT regardless of verdict
@@ -137,6 +155,16 @@ mode = "auto"
 
 # GitHub logins whose PRs are skipped (e.g. bots you don't want reviewed).
 skip_authors = ["dependabot[bot]", "renovate[bot]"]
+
+# What to do when every configured developer IS the PR's own author, so no
+# one is eligible to post a non-self review:
+#   "comment" — post the review as comment-only (default)
+#   "skip"    — skip the PR entirely, posting nothing
+author_fallback = "comment"
+
+# Optional self-token override (see "Self-token repo override" below).
+# self_token = "ghp_REPLACE_ME_SELF"
+self_review_repos = []
 
 # Hard cap per scheduled scan. Protects against runaway token spend if a
 # stack of PRs lands at once. Set to 0 for no cap.
@@ -174,8 +202,61 @@ A PR is reviewed when **all** of these are true:
 - Diff is at or below `max_diff_lines`
 - Per-scan cap `max_prs_per_scan` not yet hit
 
-If you authored the PR, the event is automatically downgraded to `COMMENT`
+### Who posts the review
+
+**No `[[github.developers]]` configured (single-user fallback).** SpectraBot
+posts every review with whatever identity `gh` is already authenticated as. If
+that user authored the PR, the event is automatically downgraded to `COMMENT`
 even in `auto` mode — GitHub doesn't allow self-approval.
+
+**One or more `[[github.developers]]` configured.** Each developer entry has a
+`login` and a `token`. For each PR, SpectraBot picks the **first developer in
+config order whose `login` is not the PR author** and posts the review under
+that developer's token — so no one ever reviews their own PR. List your team
+in the order you want them tried; if a developer's token has been revoked or
+lost repo access, SpectraBot falls through to the next eligible developer.
+
+Configured tokens are validated at startup: SpectraBot resolves each token to
+a GitHub login and warns on a mismatch or an unusable token (see
+[Troubleshooting](#6-troubleshooting)).
+
+**Author fallback.** When *every* configured developer is the PR's own author
+(e.g. a solo repo, or a PR by the only listed developer), no one is eligible
+to post a non-self review. `[review] author_fallback` decides what happens:
+
+- `"comment"` (default) — post the review as comment-only, under the author's
+  own token. The review still appears; it just can't be an approval.
+- `"skip"` — skip the PR entirely and post nothing. A reason is logged.
+
+`skip_authors` is independent of reviewer selection: it only filters which PRs
+get reviewed at all. A developer listed in both `skip_authors` and
+`[[github.developers]]` can still be selected to *review* other people's PRs.
+
+### Self-token repo override
+
+Sometimes you want specific repos reviewed under your *own* identity rather
+than the developer rotation. `[review] self_token` and `self_review_repos`
+handle that:
+
+```toml
+[review]
+self_token = "ghp_REPLACE_ME_SELF"
+self_review_repos = ["myorg/infra", "myorg/private-tooling"]
+```
+
+- Any repo in `self_review_repos` is reviewed with `self_token` instead of the
+  `[[github.developers]]` rotation. This override takes precedence — a repo in
+  both `[github] repos` and `self_review_repos` uses the `self_token` path.
+- On an override repo, if the PR author equals `self_token`'s own login, the
+  event is downgraded to `COMMENT` regardless of verdict (you can't approve
+  your own PR). The `author_fallback` setting does **not** apply to override
+  repos — `self_token` is always the reviewer there.
+- `self_review_repos` defaults to empty, which leaves the multi-developer
+  behavior unchanged. If `self_review_repos` is non-empty, `self_token` must
+  be set or SpectraBot aborts at startup with a clear error.
+
+`self_token` needs `repo` scope (and SSO authorization where applicable), just
+like every developer token. Keep `config.toml` private — `chmod 600`.
 
 ### Editing the prompt
 
@@ -288,10 +369,15 @@ launchctl load   ~/Library/LaunchAgents/com.spectrabot.scan.plist   # resume
   "myorg/api-server#1234": {
     "head_sha": "abc123def456...",
     "reviewed_at": "2026-05-14T18:55:52+00:00",
-    "url": "https://github.com/myorg/api-server/pull/1234"
+    "url": "https://github.com/myorg/api-server/pull/1234",
+    "reviewer": "alice"
   }
 }
 ```
+
+The `reviewer` field records which developer's token posted the review.
+Legacy entries written before multi-developer support omit it and still load
+fine.
 
 Operations:
 
@@ -367,6 +453,26 @@ transfer, etc.) and the check doesn't match. Add it to `skip_authors`.
 **Same PR reviewed twice**
 The state file might be missing or unwritable. `ls -l ~/.spectrabot/state/`
 should show `reviewed.json` owned by you and writable.
+
+**`WARN: developer <login> token resolves to <other> (login mismatch)`**
+The `token` for that `[[github.developers]]` entry authenticates as a
+different GitHub user than its configured `login`. The token is still usable
+(SpectraBot keeps it), but the `login` is what's used to decide "not the
+author" — fix the entry so `login` matches the token's real user.
+
+**`WARN: developer <login> token invalid — skipping`**
+That developer's token didn't authenticate at all (revoked, expired, or
+missing scope). SpectraBot drops that developer from selection for the run and
+carries on with the remaining valid developers — it does not abort the scan.
+The same WARN is logged for a bad `self_token`; override repos are then
+skipped until the token is fixed.
+
+**A PR was reviewed as `COMMENT` even though the diff looks approvable**
+When *every* configured developer is the PR's author, no one is eligible to
+post a non-self review, so with `author_fallback = "comment"` (the default)
+the review is downgraded to comment-only. Add another developer to
+`[[github.developers]]`, or set `author_fallback = "skip"` if you'd rather
+those PRs be skipped entirely.
 
 **Costs ran higher than expected**
 Lower `max_prs_per_scan`, raise the timer interval, or set `max_diff_lines`
