@@ -60,7 +60,30 @@ def _log_file() -> Path:
     return LOG_DIR / f"spectrabot-{datetime.now(timezone.utc):%Y-%m-%d}.log"
 
 
+# Token values registered at startup (see `register_secret`). `log()` scrubs
+# any of these from every message — defense in depth so a developer token can
+# never reach the log file or stdout, even via an exception message we don't
+# control (e.g. a `gh` error). Only login values should ever appear in output.
+_SECRET_TOKENS: set[str] = set()
+
+
+def register_secret(value: str | None) -> None:
+    """Register a token so `log()` redacts it from all output. Called once per
+    configured developer token at startup, before any scanning."""
+    if value:
+        _SECRET_TOKENS.add(value)
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace every registered token in `text` with a placeholder."""
+    for secret in _SECRET_TOKENS:
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
 def log(msg: str, level: str = "info") -> None:
+    msg = _redact_secrets(msg)
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tag = _LEVEL_TAGS.get(level, "INFO")
     plain = f"{ts} {tag:<5} {msg}"
@@ -730,7 +753,12 @@ def main() -> int:
     cfg = load_config()
     # Validate the multi-developer config at startup so misconfiguration is
     # caught before any scanning. Consumed by reviewer selection in later work.
-    developers = validate_developers(parse_developers(cfg))
+    # Register every developer token first so `log()` scrubs it from output,
+    # including any error logged during validation itself.
+    parsed_developers = parse_developers(cfg)
+    for dev in parsed_developers:
+        register_secret(dev["token"])
+    developers = validate_developers(parsed_developers)
     author_fallback = parse_author_fallback(cfg)
     # Read-only gh calls (pr list/view/diff, graphql) run as the first
     # configured developer; with no developers configured they use ambient auth.

@@ -571,5 +571,47 @@ class ApproveResolvedPrTest(unittest.TestCase):
         self.assertEqual(result, {"event": "APPROVE", "reviewer": "alice"})
 
 
+class SecretRedactionTest(unittest.TestCase):
+    """log() must never emit a registered developer token."""
+
+    def setUp(self):
+        self._saved = set(scan._SECRET_TOKENS)
+        scan._SECRET_TOKENS.clear()
+
+    def tearDown(self):
+        scan._SECRET_TOKENS.clear()
+        scan._SECRET_TOKENS.update(self._saved)
+
+    def test_register_secret_ignores_empty_values(self):
+        scan.register_secret("")
+        scan.register_secret(None)
+        self.assertEqual(scan._SECRET_TOKENS, set())
+
+    def test_redact_secrets_replaces_registered_token(self):
+        scan.register_secret("ghp_supersecret")
+        redacted = scan._redact_secrets("auth failed for ghp_supersecret here")
+        self.assertNotIn("ghp_supersecret", redacted)
+        self.assertIn("***", redacted)
+
+    def test_redact_secrets_leaves_unrelated_text_untouched(self):
+        scan.register_secret("ghp_supersecret")
+        self.assertEqual(
+            scan._redact_secrets("posting as alice"), "posting as alice"
+        )
+
+    def test_log_scrubs_token_from_stdout(self):
+        """A token that sneaks into a log message is replaced before output."""
+        scan.register_secret("ghp_leaked")
+        with mock.patch("builtins.print") as printed, mock.patch.object(
+            scan, "LOG_DIR", Path(os.devnull).parent / "spectrabot-test-logs"
+        ), mock.patch.object(scan.Path, "mkdir"), mock.patch(
+            "builtins.open", mock.mock_open()
+        ):
+            scan.log("token invalid: ghp_leaked")
+        printed_text = " ".join(str(c.args[0]) for c in printed.call_args_list)
+        self.assertNotIn("ghp_leaked", printed_text)
+        self.assertIn("***", printed_text)
+
+
 if __name__ == "__main__":
     unittest.main()
