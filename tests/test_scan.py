@@ -193,5 +193,42 @@ class ValidateDevelopersTest(unittest.TestCase):
         self.assertEqual(result, [{"login": "bob", "token": "t-bob"}])
 
 
+class SelectReviewerTest(unittest.TestCase):
+    DEVS = [
+        {"login": "alice", "token": "t-alice"},
+        {"login": "bob", "token": "t-bob"},
+    ]
+
+    @staticmethod
+    def _pr(author):
+        return {"author": {"login": author}}
+
+    def test_no_developers_falls_back_to_ambient(self):
+        result = scan.select_reviewer(self._pr("carol"), [])
+        self.assertEqual(result, {"kind": "ambient", "developer": None})
+
+    def test_first_non_author_developer_in_config_order(self):
+        result = scan.select_reviewer(self._pr("carol"), self.DEVS)
+        self.assertEqual(result["kind"], "developer")
+        self.assertEqual(result["developer"], self.DEVS[0])
+
+    def test_skips_author_and_picks_next_developer(self):
+        result = scan.select_reviewer(self._pr("alice"), self.DEVS)
+        self.assertEqual(result["kind"], "developer")
+        self.assertEqual(result["developer"], self.DEVS[1])
+
+    def test_all_developers_are_author_signals_fallback(self):
+        only_alice = [{"login": "alice", "token": "t-alice"}]
+        result = scan.select_reviewer(self._pr("alice"), only_alice)
+        self.assertEqual(result["kind"], "author_fallback")
+        self.assertEqual(result["developer"], only_alice[0])
+
+    def test_skip_authors_is_not_consulted(self):
+        """A developer is selectable even if their login is a skip_author —
+        select_reviewer takes no skip list and must not filter on one."""
+        result = scan.select_reviewer(self._pr("carol"), self.DEVS)
+        self.assertEqual(result["developer"]["login"], "alice")
+
+
 if __name__ == "__main__":
     unittest.main()

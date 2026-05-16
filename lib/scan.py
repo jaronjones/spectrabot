@@ -261,6 +261,34 @@ def validate_developers(developers: list[dict]) -> list[dict]:
     return valid
 
 
+def select_reviewer(pr: dict, developers: list[dict]) -> dict:
+    """Choose which identity should post the review for `pr`.
+
+    `developers` is the validated, ordered developer list (see
+    `validate_developers`). `skip_authors` is intentionally NOT consulted: that
+    list only decides which PRs get reviewed at all, so a developer who also
+    appears in skip_authors can still be picked as a reviewer.
+
+    Returns a dict describing the choice:
+      {"kind": "developer", "developer": {...}}
+          the first developer, in config order, whose login differs from the
+          PR author — an eligible non-self reviewer.
+      {"kind": "author_fallback", "developer": {...}}
+          every configured developer is the PR author, so no one can post a
+          non-self review; `developer` is the author's own entry (its token is
+          needed to post the fallback COMMENT, handled per author_fallback).
+      {"kind": "ambient", "developer": None}
+          no developers configured — fall back to ambient `gh` auth.
+    """
+    author = pr["author"]["login"]
+    if not developers:
+        return {"kind": "ambient", "developer": None}
+    for dev in developers:
+        if dev["login"] != author:
+            return {"kind": "developer", "developer": dev}
+    return {"kind": "author_fallback", "developer": developers[0]}
+
+
 def list_open_prs(repo: str) -> list[dict]:
     return gh_json(
         [
@@ -628,6 +656,23 @@ def main() -> int:
             if max_prs and reviewed_this_run >= max_prs:
                 log(f"[{pr_id}] skip: max_prs_per_scan ({max_prs}) reached")
                 continue
+
+            # Decide who would post this PR's review. The result is consumed by
+            # the event-decision and posting work in later stories; for now it
+            # is logged so the chosen reviewer is visible per PR.
+            selection = select_reviewer(pr, developers)
+            reviewer_login = (
+                selection["developer"]["login"]
+                if selection["developer"]
+                else viewer
+            )
+            if selection["kind"] == "author_fallback":
+                log(
+                    f"[{pr_id}] selected reviewer: {reviewer_login} "
+                    "(PR author — no other eligible developer configured)"
+                )
+            else:
+                log(f"[{pr_id}] selected reviewer: {reviewer_login}")
 
             if action == "approve":
                 log(f"[{pr_id}] prior comments resolved — approving")
