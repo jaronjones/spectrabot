@@ -136,6 +136,58 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
+VALID_AUTHOR_FALLBACK = ("comment", "skip")
+
+
+def parse_developers(cfg: dict) -> list[dict]:
+    """Read [[github.developers]] into an ordered list of
+    {"login": str, "token": str}, preserving config order.
+
+    Returns an empty list when none are configured — SpectraBot then keeps its
+    single-user behavior, reviewing with whatever identity `gh` is already
+    authenticated as. Aborts with a clear error when an entry is missing its
+    login or token.
+    """
+    raw = cfg.get("github", {}).get("developers", []) or []
+    developers: list[dict] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            sys.exit(
+                f"config error: github.developers entry #{i + 1} must be a "
+                "table with a login and token"
+            )
+        login = entry.get("login")
+        token = entry.get("token")
+        missing = [
+            field
+            for field, value in (("login", login), ("token", token))
+            if not value
+        ]
+        if missing:
+            label = f"'{login}'" if login else f"#{i + 1}"
+            sys.exit(
+                f"config error: github.developers entry {label} is missing "
+                f"required field(s): {', '.join(missing)}"
+            )
+        developers.append({"login": login, "token": token})
+    return developers
+
+
+def parse_author_fallback(cfg: dict) -> str:
+    """Read [review] author_fallback — 'comment' (default) or 'skip'.
+
+    Decides what happens when every configured developer is the PR's own
+    author, so no one is eligible to post a non-self review.
+    """
+    value = cfg.get("review", {}).get("author_fallback", "comment")
+    if value not in VALID_AUTHOR_FALLBACK:
+        sys.exit(
+            "config error: review.author_fallback must be one of "
+            f"{', '.join(VALID_AUTHOR_FALLBACK)}; got {value!r}"
+        )
+    return value
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text())
@@ -476,6 +528,10 @@ def main() -> int:
 
     prune_old_logs()
     cfg = load_config()
+    # Validate the multi-developer config at startup so misconfiguration is
+    # caught before any scanning. Consumed by reviewer selection in later work.
+    developers = parse_developers(cfg)
+    author_fallback = parse_author_fallback(cfg)
     state = load_state()
     prompt_text = PROMPT_PATH.read_text()
 
