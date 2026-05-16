@@ -143,5 +143,55 @@ class PostReviewTokenTest(unittest.TestCase):
             self.assertEqual(call.kwargs["env"]["GH_TOKEN"], "t-secret")
 
 
+class ValidateDevelopersTest(unittest.TestCase):
+    DEVS = [
+        {"login": "alice", "token": "t-alice"},
+        {"login": "bob", "token": "t-bob"},
+    ]
+
+    def test_empty_list_returns_empty(self):
+        with mock.patch.object(scan, "gh") as g:
+            self.assertEqual(scan.validate_developers([]), [])
+        g.assert_not_called()
+
+    def test_each_developer_resolved_with_own_token(self):
+        with mock.patch.object(scan, "gh", side_effect=["alice", "bob"]) as g:
+            result = scan.validate_developers(self.DEVS)
+        self.assertEqual(result, self.DEVS)
+        tokens = [c.kwargs.get("token") for c in g.call_args_list]
+        self.assertEqual(tokens, ["t-alice", "t-bob"])
+
+    def test_invalid_token_excluded_without_crashing(self):
+        def fake_gh(args, token=None, **kwargs):
+            if token == "t-bob":
+                raise scan.subprocess.CalledProcessError(1, ["gh", *args])
+            return "alice"
+
+        with mock.patch.object(scan, "gh", side_effect=fake_gh):
+            result = scan.validate_developers(self.DEVS)
+        self.assertEqual(result, [{"login": "alice", "token": "t-alice"}])
+
+    def test_login_mismatch_kept_but_warned(self):
+        with mock.patch.object(scan, "gh", side_effect=["someone-else", "bob"]):
+            with mock.patch.object(scan, "log") as logged:
+                result = scan.validate_developers(self.DEVS)
+        self.assertEqual(result, self.DEVS)
+        warned = " ".join(
+            str(c.args[0]) for c in logged.call_args_list
+        )
+        self.assertIn("alice", warned)
+        self.assertIn("someone-else", warned)
+
+    def test_one_bad_token_leaves_remaining_developers_usable(self):
+        def fake_gh(args, token=None, **kwargs):
+            if token == "t-alice":
+                raise scan.subprocess.CalledProcessError(1, ["gh", *args])
+            return "bob"
+
+        with mock.patch.object(scan, "gh", side_effect=fake_gh):
+            result = scan.validate_developers(self.DEVS)
+        self.assertEqual(result, [{"login": "bob", "token": "t-bob"}])
+
+
 if __name__ == "__main__":
     unittest.main()

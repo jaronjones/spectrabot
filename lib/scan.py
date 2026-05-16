@@ -227,6 +227,40 @@ def viewer_login() -> str:
     return gh(["api", "user", "--jq", ".login"]).strip()
 
 
+def validate_developers(developers: list[dict]) -> list[dict]:
+    """Resolve each configured developer's token via `gh api user` and return
+    the developers usable for reviewer selection.
+
+    A developer whose token is invalid or unauthorized is logged with a WARN
+    and dropped from the returned list — the scan continues with the rest. A
+    developer whose token authenticates but resolves to a different login than
+    configured is logged with a WARN yet kept, since the token still works.
+    Validation never aborts the scan.
+    """
+    valid: list[dict] = []
+    for dev in developers:
+        login = dev["login"]
+        try:
+            resolved = gh(
+                ["api", "user", "--jq", ".login"], token=dev["token"]
+            ).strip()
+        except subprocess.CalledProcessError as e:
+            log(
+                f"developer {login!r}: token invalid or unauthorized — "
+                f"excluding from reviewer selection ({e})",
+                level="warn",
+            )
+            continue
+        if resolved != login:
+            log(
+                f"developer {login!r}: token resolves to login {resolved!r}, "
+                "not the configured login — check config.toml",
+                level="warn",
+            )
+        valid.append(dev)
+    return valid
+
+
 def list_open_prs(repo: str) -> list[dict]:
     return gh_json(
         [
@@ -546,7 +580,7 @@ def main() -> int:
     cfg = load_config()
     # Validate the multi-developer config at startup so misconfiguration is
     # caught before any scanning. Consumed by reviewer selection in later work.
-    developers = parse_developers(cfg)
+    developers = validate_developers(parse_developers(cfg))
     author_fallback = parse_author_fallback(cfg)
     state = load_state()
     prompt_text = PROMPT_PATH.read_text()
