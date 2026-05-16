@@ -247,6 +247,30 @@ class ValidateDevelopersTest(unittest.TestCase):
         self.assertEqual(result, [{"login": "bob", "token": "t-bob"}])
 
 
+class ValidateSelfTokenTest(unittest.TestCase):
+    """validate_self_token resolves the operator's self_token to a login,
+    failing soft (WARN + None) when the token is bad."""
+
+    def test_unset_token_returns_none_without_calling_gh(self):
+        with mock.patch.object(scan, "gh") as g:
+            self.assertIsNone(scan.validate_self_token(None))
+            self.assertIsNone(scan.validate_self_token(""))
+        g.assert_not_called()
+
+    def test_valid_token_resolves_login_using_that_token(self):
+        with mock.patch.object(scan, "gh", return_value="operator\n") as g:
+            self.assertEqual(scan.validate_self_token("t-self"), "operator")
+        self.assertEqual(g.call_args.kwargs.get("token"), "t-self")
+
+    def test_invalid_token_returns_none_and_warns(self):
+        err = scan.subprocess.CalledProcessError(1, ["gh", "api", "user"])
+        with mock.patch.object(scan, "gh", side_effect=err):
+            with mock.patch.object(scan, "log") as logged:
+                self.assertIsNone(scan.validate_self_token("t-bad"))
+        warned = " ".join(str(c.args[0]) for c in logged.call_args_list)
+        self.assertIn("self_token", warned)
+
+
 class SelectReviewerTest(unittest.TestCase):
     DEVS = [
         {"login": "alice", "token": "t-alice"},

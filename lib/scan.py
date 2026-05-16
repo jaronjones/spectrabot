@@ -317,6 +317,27 @@ def validate_developers(developers: list[dict]) -> list[dict]:
     return valid
 
 
+def validate_self_token(token: str | None) -> str | None:
+    """Resolve the operator's self_token to its GitHub login via `gh api user`.
+
+    Returns the resolved login, or None when the token is unset or fails to
+    authenticate. A token that fails is logged with a WARN; the scan continues
+    and the self-review override repos that depend on it are skipped rather
+    than crashing — mirrors `validate_developers`' fail-soft behavior.
+    """
+    if not token:
+        return None
+    try:
+        return gh(["api", "user", "--jq", ".login"], token=token).strip()
+    except subprocess.CalledProcessError as e:
+        log(
+            "review.self_token is invalid or unauthorized — self-review "
+            f"override repos cannot be reviewed ({e})",
+            level="warn",
+        )
+        return None
+
+
 def select_reviewer(pr: dict, developers: list[dict]) -> dict:
     """Choose which identity should post the review for `pr`.
 
@@ -794,11 +815,15 @@ def main() -> int:
     developers = validate_developers(parsed_developers)
     author_fallback = parse_author_fallback(cfg)
     # Repos that bypass the developer rotation and are reviewed with the
-    # operator's own token (consumed by override routing in later work).
+    # operator's own self_token. `self_login` is that token's resolved GitHub
+    # login (None when the token is unset or fails to authenticate).
     self_review = parse_self_review(cfg)
     register_secret(self_review["token"])
+    self_login = validate_self_token(self_review["token"])
+    override_repos = set(self_review["repos"])
     # Read-only gh calls (pr list/view/diff, graphql) run as the first
     # configured developer; with no developers configured they use ambient auth.
+    # Override repos use self_token instead — see `repo_read_token` below.
     read_token = developers[0]["token"] if developers else None
     state = load_state()
     prompt_text = PROMPT_PATH.read_text()
@@ -824,8 +849,19 @@ def main() -> int:
     start = time.time()
 
     for repo in repos:
+        # Override repos bypass the [[github.developers]] rotation entirely:
+        # every PR is read and reviewed with the operator's own self_token.
+        is_override = repo in override_repos
+        if is_override and self_login is None:
+            log(
+                f"[{repo}] skip: review.self_token did not validate — this "
+                "self-review override repo cannot be reviewed",
+                level="warn",
+            )
+            continue
+        repo_read_token = self_review["token"] if is_override else read_token
         try:
-            prs = list_open_prs(repo, token=read_token)
+            prs = list_open_prs(repo, token=repo_read_token)
         except subprocess.CalledProcessError as e:
             log(f"[{repo}] gh pr list failed: {e}")
             continue
@@ -843,7 +879,8 @@ def main() -> int:
             action = "review"
             if not args.force and pr_id in state:
                 action = previously_reviewed_action(
-                    repo, pr, state[pr_id], reviewer_logins, token=read_token
+                    repo, pr, state[pr_id], reviewer_logins,
+                    token=repo_read_token,
                 )
 
             if action == "skip":
@@ -856,10 +893,23 @@ def main() -> int:
 
             # Decide who would post this PR's review. The event decision below
             # is made against this selected reviewer, not a single global user.
-            selection = select_reviewer(pr, developers)
-            candidates = reviewer_candidates(pr, developers, viewer)
+            # An override repo always posts as the operator's own self_token,
+            # bypassing the developer rotation and the author-fallback rule.
+            if is_override:
+                selection = {"kind": "self_override", "developer": None}
+                candidates = [
+                    {"login": self_login, "token": self_review["token"]}
+                ]
+            else:
+                selection = select_reviewer(pr, developers)
+                candidates = reviewer_candidates(pr, developers, viewer)
             reviewer_login = candidates[0]["login"]
-            if selection["kind"] == "author_fallback":
+            if selection["kind"] == "self_override":
+                log(
+                    f"[{pr_id}] selected reviewer: {reviewer_login} "
+                    "(self-token override)"
+                )
+            elif selection["kind"] == "author_fallback":
                 log(
                     f"[{pr_id}] selected reviewer: {reviewer_login} "
                     "(PR author — no other eligible developer configured)"
@@ -906,7 +956,7 @@ def main() -> int:
             log(f"[{pr_id}] reviewing @ {pr['headRefOid'][:8]}: {pr['title']}")
             try:
                 result = review_one_pr(
-                    repo, pr, prompt_text, cfg, candidates, read_token,
+                    repo, pr, prompt_text, cfg, candidates, repo_read_token,
                     args.dry_run
                 )
                 if not args.dry_run:
