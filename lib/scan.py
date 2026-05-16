@@ -637,7 +637,11 @@ def review_one_pr(
             f"  [dry-run] would post review as {reviewer_login}:\n"
             f"{json.dumps(payload, indent=2)[:2000]}"
         )
-        return {"verdict": verdict, "inline_count": inline_count}
+        return {
+            "verdict": verdict,
+            "inline_count": inline_count,
+            "reviewer": reviewer_login,
+        }
 
     errors = []
     for candidate in candidates:
@@ -653,7 +657,11 @@ def review_one_pr(
             continue
         if event == "APPROVE":
             celebrate_approval(f"{repo}#{pr_number}")
-        return {"verdict": verdict, "inline_count": inline_count}
+        return {
+            "verdict": verdict,
+            "inline_count": inline_count,
+            "reviewer": candidate["login"],
+        }
 
     raise RuntimeError(
         "every eligible developer failed to post the review "
@@ -779,6 +787,7 @@ def main() -> int:
                             "head_sha": pr["headRefOid"],
                             "reviewed_at": datetime.now(timezone.utc).isoformat(),
                             "verdict": "approve" if event == "APPROVE" else state[pr_id].get("verdict"),
+                            "reviewer": reviewer_login,
                         }
                         save_state(state)
                     reviewed_this_run += 1
@@ -803,6 +812,7 @@ def main() -> int:
                         "url": pr["url"],
                         "verdict": result["verdict"],
                         "inline_comment_count": result["inline_count"],
+                        "reviewer": result["reviewer"],
                     }
                     save_state(state)
                 reviewed_this_run += 1

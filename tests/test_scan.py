@@ -380,6 +380,27 @@ class ReviewOnePrTest(unittest.TestCase):
         logged_text = " ".join(str(c.args[0]) for c in logged.call_args_list)
         self.assertIn("alice", logged_text)
 
+    def test_result_records_posting_developer_login(self):
+        """The result's reviewer field is the developer that actually posted."""
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        result, _, _ = self._run(candidates)
+        self.assertEqual(result["reviewer"], "alice")
+
+    def test_result_reviewer_is_the_fallthrough_developer(self):
+        """When the first candidate fails, reviewer is the one that succeeded."""
+        candidates = [
+            {"login": "alice", "token": "t-alice"},
+            {"login": "bob", "token": "t-bob"},
+        ]
+        post = [RuntimeError("revoked token"), None]
+        result, _, _ = self._run(candidates, post=post)
+        self.assertEqual(result["reviewer"], "bob")
+
+    def test_dry_run_result_records_first_candidate_login(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        result, _, _ = self._run(candidates, dry_run=True)
+        self.assertEqual(result["reviewer"], "alice")
+
 
 if __name__ == "__main__":
     unittest.main()
