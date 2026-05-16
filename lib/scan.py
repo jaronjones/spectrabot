@@ -201,12 +201,25 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_PATH)
 
 
-def gh(args: list[str], **kwargs) -> str:
+def _gh_env(token: str | None) -> dict | None:
+    """Environment for a gh subprocess. When `token` is set, return a copy of
+    the parent environment with GH_TOKEN overridden; the parent environment
+    itself is never mutated. When `token` is None, return None so the
+    subprocess inherits the parent environment unchanged (ambient auth)."""
+    if not token:
+        return None
+    return {**os.environ, "GH_TOKEN": token}
+
+
+def gh(args: list[str], token: str | None = None, **kwargs) -> str:
+    env = _gh_env(token)
+    if env is not None:
+        kwargs["env"] = env
     return subprocess.check_output(["gh", *args], text=True, **kwargs)
 
 
-def gh_json(args: list[str]) -> object:
-    out = gh(args).strip()
+def gh_json(args: list[str], token: str | None = None) -> object:
+    out = gh(args, token=token).strip()
     return json.loads(out) if out else None
 
 
@@ -316,8 +329,9 @@ def build_review_payload(review: dict, head_sha: str, event: str) -> dict:
     return payload
 
 
-def post_review(repo: str, pr_number: int, payload: dict) -> None:
+def post_review(repo: str, pr_number: int, payload: dict, token: str | None = None) -> None:
     owner, name = repo.split("/", 1)
+    env = _gh_env(token)
     proc = subprocess.run(
         [
             "gh", "api",
@@ -328,6 +342,7 @@ def post_review(repo: str, pr_number: int, payload: dict) -> None:
         input=json.dumps(payload),
         text=True,
         capture_output=True,
+        env=env,
     )
     if proc.returncode != 0:
         # If inline comments fail (e.g. line not in diff), retry without them.
@@ -349,6 +364,7 @@ def post_review(repo: str, pr_number: int, payload: dict) -> None:
                 input=json.dumps(retry),
                 text=True,
                 capture_output=True,
+                env=env,
             )
             if proc2.returncode != 0:
                 raise RuntimeError(f"gh api review failed: {proc2.stderr.strip()[:500]}")
