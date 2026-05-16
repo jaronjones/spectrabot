@@ -838,7 +838,13 @@ def main() -> int:
     # `gh` identity when no developers are configured.
     reviewer_logins = {dev["login"] for dev in developers} or {viewer}
 
-    repos = [args.repo] if args.repo else cfg.get("github", {}).get("repos", [])
+    if args.repo:
+        repos = [args.repo]
+    else:
+        config_repos = cfg.get("github", {}).get("repos", [])
+        # self_review_repos must be scanned even when absent from [github] repos
+        # — they're reviewed with self_token via the is_override branch below.
+        repos = list(dict.fromkeys([*config_repos, *self_review["repos"]]))
     if not repos:
         log("no repos configured; nothing to do")
         return 0
