@@ -73,6 +73,60 @@ class ParseAuthorFallbackTest(unittest.TestCase):
             scan.parse_author_fallback(cfg)
 
 
+class ParseSelfReviewTest(unittest.TestCase):
+    def test_absent_returns_no_override(self):
+        """No [review] self-token config leaves multi-developer behavior."""
+        self.assertEqual(
+            scan.parse_self_review({}), {"token": None, "repos": []}
+        )
+        self.assertEqual(
+            scan.parse_self_review({"review": {}}),
+            {"token": None, "repos": []},
+        )
+
+    def test_empty_self_review_repos_returns_no_override(self):
+        cfg = {"review": {"self_review_repos": []}}
+        self.assertEqual(
+            scan.parse_self_review(cfg), {"token": None, "repos": []}
+        )
+
+    def test_token_and_repos_are_read(self):
+        cfg = {
+            "review": {
+                "self_token": "t-self",
+                "self_review_repos": ["octocat/hello", "octocat/world"],
+            }
+        }
+        self.assertEqual(
+            scan.parse_self_review(cfg),
+            {"token": "t-self", "repos": ["octocat/hello", "octocat/world"]},
+        )
+
+    def test_repos_without_token_aborts(self):
+        cfg = {"review": {"self_review_repos": ["octocat/hello"]}}
+        with self.assertRaises(SystemExit) as ctx:
+            scan.parse_self_review(cfg)
+        message = str(ctx.exception)
+        self.assertIn("self_token", message)
+        self.assertIn("self_review_repos", message)
+
+    def test_token_without_repos_is_allowed(self):
+        cfg = {"review": {"self_token": "t-self"}}
+        self.assertEqual(
+            scan.parse_self_review(cfg), {"token": "t-self", "repos": []}
+        )
+
+    def test_non_list_self_review_repos_aborts(self):
+        cfg = {"review": {"self_token": "t", "self_review_repos": "octocat/hello"}}
+        with self.assertRaises(SystemExit):
+            scan.parse_self_review(cfg)
+
+    def test_non_string_repo_entry_aborts(self):
+        cfg = {"review": {"self_token": "t", "self_review_repos": [123]}}
+        with self.assertRaises(SystemExit):
+            scan.parse_self_review(cfg)
+
+
 class GhTokenTest(unittest.TestCase):
     def test_gh_without_token_inherits_ambient_env(self):
         """Omitting token must not pass an env kwarg (ambient gh auth)."""

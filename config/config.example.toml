@@ -42,6 +42,18 @@ skip_authors = []
 #   "skip"    = skip the PR entirely, posting nothing
 author_fallback = "comment"
 
+# Self-token repo override. Repos listed in self_review_repos are reviewed
+# with self_token — the operator's own GitHub token — instead of the
+# [[github.developers]] rotation. Use this for repos you want reviewed under
+# your own identity. self_review_repos defaults to empty, which leaves the
+# multi-developer behavior unchanged. If self_review_repos is non-empty,
+# self_token must be set or SpectraBot aborts at startup.
+#
+# self_token needs `repo` scope (plus SSO authorization for SSO-protected
+# orgs), like every developer token. Keep this file private: chmod 600.
+# self_token = "ghp_REPLACE_ME_SELF"
+self_review_repos = []
+
 # Hard cap on PRs reviewed in a single scan. Protects against runaway token
 # spend if many PRs land at once. Set to 0 for no cap.
 max_prs_per_scan = 10

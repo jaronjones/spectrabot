@@ -211,6 +211,39 @@ def parse_author_fallback(cfg: dict) -> str:
     return value
 
 
+def parse_self_review(cfg: dict) -> dict:
+    """Read the [review] self-token override.
+
+    Returns {"token": str | None, "repos": [str, ...]}:
+      - token: the operator's own GitHub token, used to review the repos in
+        `repos` with the operator's own identity instead of the
+        [[github.developers]] rotation. None when unset.
+      - repos: 'owner/repo' strings reviewed with `token`; empty when unset,
+        which leaves the multi-developer behavior unchanged.
+
+    Aborts when `repos` is non-empty but `token` is unset — those repos would
+    have no identity to review with.
+    """
+    review = cfg.get("review", {})
+    token = review.get("self_token") or None
+    raw_repos = review.get("self_review_repos", []) or []
+    if not isinstance(raw_repos, list) or not all(
+        isinstance(r, str) for r in raw_repos
+    ):
+        sys.exit(
+            "config error: review.self_review_repos must be a list of "
+            "'owner/repo' strings"
+        )
+    repos = list(raw_repos)
+    if repos and not token:
+        sys.exit(
+            "config error: review.self_review_repos is set but "
+            "review.self_token is missing — set review.self_token to the "
+            "operator's GitHub token, or clear review.self_review_repos"
+        )
+    return {"token": token, "repos": repos}
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text())
@@ -760,6 +793,10 @@ def main() -> int:
         register_secret(dev["token"])
     developers = validate_developers(parsed_developers)
     author_fallback = parse_author_fallback(cfg)
+    # Repos that bypass the developer rotation and are reviewed with the
+    # operator's own token (consumed by override routing in later work).
+    self_review = parse_self_review(cfg)
+    register_secret(self_review["token"])
     # Read-only gh calls (pr list/view/diff, graphql) run as the first
     # configured developer; with no developers configured they use ambient auth.
     read_token = developers[0]["token"] if developers else None
