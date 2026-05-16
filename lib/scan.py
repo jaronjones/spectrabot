@@ -860,6 +860,13 @@ def main() -> int:
             )
             continue
         repo_read_token = self_review["token"] if is_override else read_token
+        # Threads opened by the operator's own self_token also count as
+        # SpectraBot's own on an override repo, so the follow-up approval flow
+        # detects resolved comments there. `self_login` is non-None here —
+        # override repos with an unvalidated self_token were skipped above.
+        repo_reviewer_logins = (
+            reviewer_logins | {self_login} if is_override else reviewer_logins
+        )
         try:
             prs = list_open_prs(repo, token=repo_read_token)
         except subprocess.CalledProcessError as e:
@@ -879,7 +886,7 @@ def main() -> int:
             action = "review"
             if not args.force and pr_id in state:
                 action = previously_reviewed_action(
-                    repo, pr, state[pr_id], reviewer_logins,
+                    repo, pr, state[pr_id], repo_reviewer_logins,
                     token=repo_read_token,
                 )
 

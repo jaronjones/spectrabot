@@ -649,6 +649,78 @@ class ApproveResolvedPrTest(unittest.TestCase):
         self.assertEqual(result, {"event": "APPROVE", "reviewer": "alice"})
 
 
+class SelfTokenFollowupTest(unittest.TestCase):
+    """US-013: on a self-token override repo, the follow-up approval flow
+    recognizes self_token's own review threads and posts re-reviews under
+    self_token."""
+
+    def test_fetch_threads_recognizes_self_login(self):
+        """When self_token's login is in the logins set, its own review
+        threads are matched (main() adds it for override repos)."""
+        nodes = [
+            {
+                "isResolved": True,
+                "isOutdated": False,
+                "comments": {"nodes": [{"author": {"login": "operator"}}]},
+            }
+        ]
+        response = {
+            "data": {
+                "repository": {
+                    "pullRequest": {"reviewThreads": {"nodes": nodes}}
+                }
+            }
+        }
+        with mock.patch.object(scan, "gh_json", return_value=response):
+            threads = scan.fetch_spectrabot_threads(
+                "owner/repo", 1, {"alice", "operator"}
+            )
+        self.assertEqual(threads, [{"resolved": True, "outdated": False}])
+
+    def test_previously_reviewed_action_approves_on_resolved_self_threads(self):
+        """previously_reviewed_action returns approve when self_token's
+        threads are all resolved on an override repo."""
+        entry = {
+            "head_sha": "sha-old",
+            "verdict": "request-changes",
+            "inline_comment_count": 1,
+        }
+        with mock.patch.object(
+            scan, "fetch_spectrabot_threads",
+            return_value=[{"resolved": True, "outdated": False}],
+        ) as ft:
+            action = scan.previously_reviewed_action(
+                "owner/repo", {"number": 3, "headRefOid": "sha-new"},
+                entry, {"operator"}, token="t-self",
+            )
+        self.assertEqual(action, "approve")
+        self.assertIn("operator", ft.call_args.args[2])
+        self.assertEqual(ft.call_args.kwargs.get("token"), "t-self")
+
+    def test_approve_posts_under_self_token_and_records_reviewer(self):
+        """approve_resolved_pr posts the override-repo re-review under
+        self_token and records its login as the reviewer."""
+        candidates = [{"login": "operator", "token": "t-self"}]
+        with mock.patch.object(scan, "post_review") as posted, \
+                mock.patch.object(scan, "celebrate_approval"):
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "carol", "auto", False
+            )
+        self.assertEqual(posted.call_args.kwargs["token"], "t-self")
+        self.assertEqual(result, {"event": "APPROVE", "reviewer": "operator"})
+
+    def test_approve_downgrades_to_comment_when_author_is_self(self):
+        """An override PR authored by the operator downgrades to COMMENT —
+        the same author-equals-self_token rule as the main scan (US-012)."""
+        candidates = [{"login": "operator", "token": "t-self"}]
+        with mock.patch.object(scan, "post_review"):
+            result = scan.approve_resolved_pr(
+                "owner/repo", 9, "sha", candidates, "operator", "auto", False
+            )
+        self.assertEqual(result["event"], "COMMENT")
+        self.assertEqual(result["reviewer"], "operator")
+
+
 class SecretRedactionTest(unittest.TestCase):
     """log() must never emit a registered developer token."""
 
