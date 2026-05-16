@@ -273,5 +273,113 @@ class DecideEventTest(unittest.TestCase):
         )
 
 
+class ReviewerCandidatesTest(unittest.TestCase):
+    DEVS = [
+        {"login": "alice", "token": "t-alice"},
+        {"login": "bob", "token": "t-bob"},
+    ]
+
+    @staticmethod
+    def _pr(author):
+        return {"author": {"login": author}}
+
+    def test_no_developers_yields_single_ambient_candidate(self):
+        self.assertEqual(
+            scan.reviewer_candidates(self._pr("carol"), [], "spectrabot"),
+            [{"login": "spectrabot", "token": None}],
+        )
+
+    def test_non_author_developers_in_config_order(self):
+        self.assertEqual(
+            scan.reviewer_candidates(self._pr("carol"), self.DEVS, "viewer"),
+            self.DEVS,
+        )
+
+    def test_pr_author_is_dropped_from_candidates(self):
+        self.assertEqual(
+            scan.reviewer_candidates(self._pr("alice"), self.DEVS, "viewer"),
+            [{"login": "bob", "token": "t-bob"}],
+        )
+
+    def test_all_developers_are_author_returns_all(self):
+        """Author-fallback: every dev is the author, so all are candidates."""
+        only_alice = [{"login": "alice", "token": "t-alice"}]
+        self.assertEqual(
+            scan.reviewer_candidates(self._pr("alice"), only_alice, "viewer"),
+            only_alice,
+        )
+
+    def test_first_candidate_matches_select_reviewer(self):
+        pr = self._pr("alice")
+        candidates = scan.reviewer_candidates(pr, self.DEVS, "viewer")
+        selection = scan.select_reviewer(pr, self.DEVS)
+        self.assertEqual(candidates[0], selection["developer"])
+
+
+class ReviewOnePrTest(unittest.TestCase):
+    PR = {"number": 7, "headRefOid": "sha123", "author": {"login": "carol"}}
+    CFG = {"review": {"mode": "auto"}}
+
+    def _run(self, candidates, read_token=None, dry_run=False, post=None):
+        review = {"recommendation": "approve", "summary": "looks good"}
+        with mock.patch.object(
+            scan, "fetch_pr_context", return_value=({"title": "t"}, "diff\n")
+        ) as fetch, mock.patch.object(
+            scan, "invoke_engine", return_value=review
+        ), mock.patch.object(
+            scan, "post_review", side_effect=post
+        ) as posted, mock.patch.object(
+            scan, "celebrate_approval"
+        ):
+            result = scan.review_one_pr(
+                "owner/repo", self.PR, "prompt", self.CFG,
+                candidates, read_token, dry_run,
+            )
+        return result, fetch, posted
+
+    def test_posts_with_first_candidates_token(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        _, _, posted = self._run(candidates)
+        self.assertEqual(posted.call_count, 1)
+        self.assertEqual(posted.call_args.kwargs["token"], "t-alice")
+
+    def test_reads_use_the_read_token(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        _, fetch, _ = self._run(candidates, read_token="t-read")
+        self.assertEqual(fetch.call_args.kwargs["token"], "t-read")
+
+    def test_falls_through_to_next_developer_on_posting_failure(self):
+        candidates = [
+            {"login": "alice", "token": "t-alice"},
+            {"login": "bob", "token": "t-bob"},
+        ]
+        post = [RuntimeError("revoked token"), None]
+        _, _, posted = self._run(candidates, post=post)
+        self.assertEqual(posted.call_count, 2)
+        self.assertEqual(
+            [c.kwargs["token"] for c in posted.call_args_list],
+            ["t-alice", "t-bob"],
+        )
+
+    def test_fails_pr_only_when_every_candidate_fails(self):
+        candidates = [
+            {"login": "alice", "token": "t-alice"},
+            {"login": "bob", "token": "t-bob"},
+        ]
+        post = [RuntimeError("alice bad"), RuntimeError("bob bad")]
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(candidates, post=post)
+        self.assertIn("alice", str(ctx.exception))
+        self.assertIn("bob", str(ctx.exception))
+
+    def test_dry_run_posts_nothing_and_logs_reviewer_login(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        with mock.patch.object(scan, "log") as logged:
+            _, _, posted = self._run(candidates, dry_run=True)
+        posted.assert_not_called()
+        logged_text = " ".join(str(c.args[0]) for c in logged.call_args_list)
+        self.assertIn("alice", logged_text)
+
+
 if __name__ == "__main__":
     unittest.main()

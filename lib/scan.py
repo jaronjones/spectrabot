@@ -289,7 +289,34 @@ def select_reviewer(pr: dict, developers: list[dict]) -> dict:
     return {"kind": "author_fallback", "developer": developers[0]}
 
 
-def list_open_prs(repo: str) -> list[dict]:
+def reviewer_candidates(
+    pr: dict, developers: list[dict], viewer: str
+) -> list[dict]:
+    """Ordered identities that may post `pr`'s review, each a
+    {"login": str, "token": str | None} dict.
+
+    `review_one_pr` tries them in config order, falling through to the next
+    when a developer's token fails to post (revoked token, lost repo scope),
+    and fails the PR only when every candidate fails.
+
+    - No developers configured: a single ambient-auth candidate (token None),
+      posting as whatever `gh` is already authenticated as (`viewer`).
+    - One or more eligible non-author developers: those developers in config
+      order — never the PR author, so APPROVE stays allowed.
+    - Every configured developer is the PR author (author-fallback): the
+      developer entries as-is; the review posts as the author and
+      `decide_event` downgrades it to COMMENT.
+
+    The first candidate's login always matches `select_reviewer`'s choice.
+    """
+    if not developers:
+        return [{"login": viewer, "token": None}]
+    author = pr["author"]["login"]
+    eligible = [dev for dev in developers if dev["login"] != author]
+    return eligible or list(developers)
+
+
+def list_open_prs(repo: str, token: str | None = None) -> list[dict]:
     return gh_json(
         [
             "pr", "list",
@@ -297,20 +324,24 @@ def list_open_prs(repo: str) -> list[dict]:
             "--state", "open",
             "--json", "number,headRefOid,isDraft,author,reviewDecision,title,url",
             "--limit", "100",
-        ]
+        ],
+        token=token,
     ) or []
 
 
-def fetch_pr_context(repo: str, pr_number: int) -> tuple[dict, str]:
+def fetch_pr_context(
+    repo: str, pr_number: int, token: str | None = None
+) -> tuple[dict, str]:
     meta = gh_json(
         [
             "pr", "view", str(pr_number),
             "--repo", repo,
             "--json",
             "title,body,author,baseRefName,headRefName,additions,deletions,changedFiles,files,url",
-        ]
+        ],
+        token=token,
     )
-    diff = gh(["pr", "diff", str(pr_number), "--repo", repo])
+    diff = gh(["pr", "diff", str(pr_number), "--repo", repo], token=token)
     return meta, diff
 
 
@@ -446,7 +477,9 @@ def post_review(repo: str, pr_number: int, payload: dict, token: str | None = No
         raise RuntimeError(f"gh api review failed: {proc.stderr.strip()[:500]}")
 
 
-def fetch_spectrabot_threads(repo: str, pr_number: int, viewer: str) -> list[dict]:
+def fetch_spectrabot_threads(
+    repo: str, pr_number: int, viewer: str, token: str | None = None
+) -> list[dict]:
     """Return the review threads on a PR whose first comment was authored by
     `viewer` (i.e. SpectraBot's own threads). Each item is
     {"resolved": bool, "outdated": bool}."""
@@ -466,7 +499,7 @@ def fetch_spectrabot_threads(repo: str, pr_number: int, viewer: str) -> list[dic
         "-f", f"owner={owner}",
         "-f", f"name={name}",
         "-F", f"number={pr_number}",
-    ]) or {}
+    ], token=token) or {}
     nodes = (
         (out.get("data") or {})
         .get("repository", {})
@@ -491,7 +524,7 @@ def fetch_spectrabot_threads(repo: str, pr_number: int, viewer: str) -> list[dic
 
 
 def previously_reviewed_action(
-    repo: str, pr: dict, state_entry: dict, viewer: str
+    repo: str, pr: dict, state_entry: dict, viewer: str, token: str | None = None
 ) -> str:
     """For a PR already in state, decide whether to skip, approve, or rescan.
 
@@ -513,7 +546,7 @@ def previously_reviewed_action(
         return "rescan" if head_changed else "skip"
 
     try:
-        threads = fetch_spectrabot_threads(repo, pr["number"], viewer)
+        threads = fetch_spectrabot_threads(repo, pr["number"], viewer, token=token)
     except Exception as e:
         log(f"  graphql fetch failed; treating as unresolved: {e}", level="warn")
         return "rescan" if head_changed else "skip"
@@ -568,12 +601,22 @@ def review_one_pr(
     pr: dict,
     prompt_text: str,
     cfg: dict,
-    reviewer_login: str,
+    candidates: list[dict],
+    read_token: str | None,
     dry_run: bool,
 ) -> dict:
+    """Review a single PR and post the result.
+
+    `candidates` is the ordered list from `reviewer_candidates`: the review is
+    posted under the first candidate's token, falling through to the next
+    candidate when posting fails (revoked token, lost repo scope) and failing
+    the PR only when every candidate fails. `read_token` authenticates the
+    read-only `gh pr view`/`pr diff` calls.
+    """
     pr_number = pr["number"]
     head_sha = pr["headRefOid"]
-    meta, diff = fetch_pr_context(repo, pr_number)
+    reviewer_login = candidates[0]["login"]
+    meta, diff = fetch_pr_context(repo, pr_number, token=read_token)
 
     max_diff = cfg.get("review", {}).get("max_diff_lines", 4000)
     diff_lines = diff.count("\n")
@@ -589,14 +632,33 @@ def review_one_pr(
 
     log(f"  verdict={verdict!r} event={event} inline={inline_count}")
 
-    if not dry_run:
-        post_review(repo, pr_number, payload)
+    if dry_run:
+        log(
+            f"  [dry-run] would post review as {reviewer_login}:\n"
+            f"{json.dumps(payload, indent=2)[:2000]}"
+        )
+        return {"verdict": verdict, "inline_count": inline_count}
+
+    errors = []
+    for candidate in candidates:
+        try:
+            post_review(repo, pr_number, payload, token=candidate["token"])
+        except Exception as e:
+            errors.append(f"{candidate['login']}: {e}")
+            log(
+                f"  posting as {candidate['login']} failed; "
+                f"trying next eligible developer: {e}",
+                level="warn",
+            )
+            continue
         if event == "APPROVE":
             celebrate_approval(f"{repo}#{pr_number}")
-    else:
-        log(f"  [dry-run] would POST review:\n{json.dumps(payload, indent=2)[:2000]}")
+        return {"verdict": verdict, "inline_count": inline_count}
 
-    return {"verdict": verdict, "inline_count": inline_count}
+    raise RuntimeError(
+        "every eligible developer failed to post the review "
+        f"({'; '.join(errors)})"
+    )
 
 
 def should_skip(pr: dict, skip_authors: set[str]) -> str | None:
@@ -629,6 +691,9 @@ def main() -> int:
     # caught before any scanning. Consumed by reviewer selection in later work.
     developers = validate_developers(parse_developers(cfg))
     author_fallback = parse_author_fallback(cfg)
+    # Read-only gh calls (pr list/view/diff, graphql) run as the first
+    # configured developer; with no developers configured they use ambient auth.
+    read_token = developers[0]["token"] if developers else None
     state = load_state()
     prompt_text = PROMPT_PATH.read_text()
 
@@ -649,7 +714,7 @@ def main() -> int:
 
     for repo in repos:
         try:
-            prs = list_open_prs(repo)
+            prs = list_open_prs(repo, token=read_token)
         except subprocess.CalledProcessError as e:
             log(f"[{repo}] gh pr list failed: {e}")
             continue
@@ -666,7 +731,9 @@ def main() -> int:
 
             action = "review"
             if not args.force and pr_id in state:
-                action = previously_reviewed_action(repo, pr, state[pr_id], viewer)
+                action = previously_reviewed_action(
+                    repo, pr, state[pr_id], viewer, token=read_token
+                )
 
             if action == "skip":
                 log(f"[{pr_id}] skip: already reviewed @ {state[pr_id].get('head_sha', '?')[:8]}")
@@ -679,11 +746,8 @@ def main() -> int:
             # Decide who would post this PR's review. The event decision below
             # is made against this selected reviewer, not a single global user.
             selection = select_reviewer(pr, developers)
-            reviewer_login = (
-                selection["developer"]["login"]
-                if selection["developer"]
-                else viewer
-            )
+            candidates = reviewer_candidates(pr, developers, viewer)
+            reviewer_login = candidates[0]["login"]
             if selection["kind"] == "author_fallback":
                 log(
                     f"[{pr_id}] selected reviewer: {reviewer_login} "
@@ -729,7 +793,8 @@ def main() -> int:
             log(f"[{pr_id}] reviewing @ {pr['headRefOid'][:8]}: {pr['title']}")
             try:
                 result = review_one_pr(
-                    repo, pr, prompt_text, cfg, reviewer_login, args.dry_run
+                    repo, pr, prompt_text, cfg, candidates, read_token,
+                    args.dry_run
                 )
                 if not args.dry_run:
                     state[pr_id] = {
