@@ -847,6 +847,7 @@ def review_one_pr(
 
     max_diff = cfg.get("review", {}).get("max_diff_lines", 4000)
     diff_lines = diff.count("\n")
+    log(f"  diff: {diff_lines} lines")
     if max_diff and diff_lines > max_diff:
         # Too big to review meaningfully in one shot. Rather than failing the
         # PR (which logs an error and re-attempts every scan), post a one-line
