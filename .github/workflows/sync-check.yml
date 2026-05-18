@@ -1,0 +1,32 @@
+name: integrations sync check
+
+on:
+  pull_request:
+    paths:
+      - pr-review.md
+      - integrations/**
+      - scripts/sync-integrations.sh
+      - .github/workflows/sync-check.yml
+  push:
+    branches: [main]
+
+jobs:
+  sync-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Regenerate integration wrappers
+        run: scripts/sync-integrations.sh
+
+      - name: Fail if wrappers drifted from canonical
+        run: |
+          if ! git diff --quiet integrations/; then
+            echo "::error::integrations/ is out of sync with pr-review.md."
+            echo "Run scripts/sync-integrations.sh and commit the result."
+            git diff --stat integrations/
+            git diff integrations/
+            exit 1
+          fi
+          echo "integrations/ is in sync with pr-review.md."
