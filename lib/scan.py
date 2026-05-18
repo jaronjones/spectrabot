@@ -338,59 +338,45 @@ def validate_self_token(token: str | None) -> str | None:
         return None
 
 
-def select_reviewer(pr: dict, developers: list[dict]) -> dict:
-    """Choose which identity should post the review for `pr`.
+def reviewer_candidates(
+    pr: dict, developers: list[dict], viewer: str | None
+) -> dict:
+    """Decide who may post `pr`'s review — the single source of truth for
+    reviewer eligibility.
 
     `developers` is the validated, ordered developer list (see
-    `validate_developers`). `skip_authors` is intentionally NOT consulted: that
-    list only decides which PRs get reviewed at all, so a developer who also
-    appears in skip_authors can still be picked as a reviewer.
+    `validate_developers`). `viewer` is the ambient `gh` login, used only when
+    no developers are configured. `skip_authors` is intentionally NOT
+    consulted: that list only decides which PRs get reviewed at all, so a
+    developer who also appears in skip_authors can still review.
 
-    Returns a dict describing the choice:
-      {"kind": "developer", "developer": {...}}
-          the first developer, in config order, whose login differs from the
-          PR author — an eligible non-self reviewer.
-      {"kind": "author_fallback", "developer": {...}}
-          every configured developer is the PR author, so no one can post a
-          non-self review; `developer` is the author's own entry (its token is
-          needed to post the fallback COMMENT, handled per author_fallback).
-      {"kind": "ambient", "developer": None}
-          no developers configured — fall back to ambient `gh` auth.
-    """
-    author = pr["author"]["login"]
-    if not developers:
-        return {"kind": "ambient", "developer": None}
-    for dev in developers:
-        if dev["login"] != author:
-            return {"kind": "developer", "developer": dev}
-    return {"kind": "author_fallback", "developer": developers[0]}
+    Returns {"kind": str, "candidates": [{"login": str, "token": str | None}]}:
+      kind "ambient"
+          no developers configured — a single ambient-auth candidate (token
+          None) posting as whatever `gh` is already authenticated as.
+      kind "developer"
+          one or more eligible non-author developers, in config order — never
+          the PR author, so an APPROVE stays allowed.
+      kind "author_fallback"
+          every configured developer is the PR author; the candidates are the
+          developers as-is, the review posts as the author and `decide_event`
+          downgrades it to COMMENT.
 
-
-def reviewer_candidates(
-    pr: dict, developers: list[dict], viewer: str
-) -> list[dict]:
-    """Ordered identities that may post `pr`'s review, each a
-    {"login": str, "token": str | None} dict.
-
-    `review_one_pr` tries them in config order, falling through to the next
+    `review_one_pr` tries `candidates` in order, falling through to the next
     when a developer's token fails to post (revoked token, lost repo scope),
-    and fails the PR only when every candidate fails.
-
-    - No developers configured: a single ambient-auth candidate (token None),
-      posting as whatever `gh` is already authenticated as (`viewer`).
-    - One or more eligible non-author developers: those developers in config
-      order — never the PR author, so APPROVE stays allowed.
-    - Every configured developer is the PR author (author-fallback): the
-      developer entries as-is; the review posts as the author and
-      `decide_event` downgrades it to COMMENT.
-
-    The first candidate's login always matches `select_reviewer`'s choice.
+    and fails the PR only when every candidate fails. `candidates[0]` is the
+    primary reviewer.
     """
     if not developers:
-        return [{"login": viewer, "token": None}]
+        return {
+            "kind": "ambient",
+            "candidates": [{"login": viewer, "token": None}],
+        }
     author = pr["author"]["login"]
     eligible = [dev for dev in developers if dev["login"] != author]
-    return eligible or list(developers)
+    if eligible:
+        return {"kind": "developer", "candidates": eligible}
+    return {"kind": "author_fallback", "candidates": list(developers)}
 
 
 def list_open_prs(repo: str, token: str | None = None) -> list[dict]:
@@ -404,6 +390,30 @@ def list_open_prs(repo: str, token: str | None = None) -> list[dict]:
         ],
         token=token,
     ) or []
+
+
+def list_open_prs_with_fallback(
+    repo: str, read_candidates: list[tuple[str, str | None]]
+) -> tuple[str | None, list[dict]]:
+    """List `repo`'s open PRs, trying each read identity in config order.
+
+    `read_candidates` is an ordered list of (label, token) pairs. Returns
+    `(token, prs)` for the first identity that can list the repo, so the same
+    token is reused for the rest of the repo's read-only calls. Raises the
+    final `CalledProcessError` when every identity fails.
+
+    This mirrors the posting path's per-candidate fall-through: a developer who
+    has lost access to one repo no longer drops that repo from the whole scan
+    as long as another configured developer still has access.
+    """
+    last_error: subprocess.CalledProcessError | None = None
+    for label, token in read_candidates:
+        try:
+            return token, list_open_prs(repo, token=token)
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            log(f"[{repo}] gh pr list failed as {label}: {e}", level="warn")
+    raise last_error
 
 
 def fetch_pr_context(
@@ -474,7 +484,7 @@ def decide_event(
     """Map the engine's recommendation to a GitHub review event.
 
     The review is posted by `reviewer_login` — the developer chosen by
-    `select_reviewer`, or the ambient `gh` identity when no developers are
+    `reviewer_candidates`, or the ambient `gh` identity when no developers are
     configured. A reviewer who is not the PR author may APPROVE. When the
     reviewer *is* the PR author (the author-fallback case, or an ambient
     single-user setup reviewing its own PR) the event is forced to COMMENT so
@@ -813,6 +823,15 @@ def main() -> int:
     for dev in parsed_developers:
         register_secret(dev["token"])
     developers = validate_developers(parsed_developers)
+    # If developers were configured but every token failed validation, abort
+    # rather than silently reverting to ambient `gh` auth — an operator who set
+    # up a developer rotation should not unknowingly post under their own
+    # identity after a mass token expiry.
+    if parsed_developers and not developers:
+        sys.exit(
+            "config error: all configured [[github.developers]] tokens "
+            "failed validation — fix or remove them"
+        )
     author_fallback = parse_author_fallback(cfg)
     # Repos that bypass the developer rotation and are reviewed with the
     # operator's own self_token. `self_login` is that token's resolved GitHub
@@ -821,17 +840,19 @@ def main() -> int:
     register_secret(self_review["token"])
     self_login = validate_self_token(self_review["token"])
     override_repos = set(self_review["repos"])
-    # Read-only gh calls (pr list/view/diff, graphql) run as the first
-    # configured developer; with no developers configured they use ambient auth.
-    # Override repos use self_token instead — see `repo_read_token` below.
-    read_token = developers[0]["token"] if developers else None
     state = load_state()
     prompt_text = PROMPT_PATH.read_text()
 
-    try:
-        viewer = viewer_login()
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"`gh` not authenticated? {e}")
+    # Ambient `gh auth` is only consulted as the no-developers fallback, so
+    # resolve `viewer` lazily — a pure multi-developer deployment need not run
+    # `gh auth login` at all.
+    if developers:
+        viewer = None
+    else:
+        try:
+            viewer = viewer_login()
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"`gh` not authenticated? {e}")
 
     # Logins whose prior review threads count as SpectraBot's own — any
     # configured developer may have posted an earlier review, or the ambient
@@ -865,7 +886,6 @@ def main() -> int:
                 level="warn",
             )
             continue
-        repo_read_token = self_review["token"] if is_override else read_token
         # Threads opened by the operator's own self_token also count as
         # SpectraBot's own on an override repo, so the follow-up approval flow
         # detects resolved comments there. `self_login` is non-None here —
@@ -873,10 +893,23 @@ def main() -> int:
         repo_reviewer_logins = (
             reviewer_logins | {self_login} if is_override else reviewer_logins
         )
+        # Read-only gh calls (pr list/view/diff, graphql) run as the override's
+        # self_token, or — for normal repos — the first configured developer
+        # that can actually read this repo, falling through the rotation so one
+        # developer's lost access doesn't drop the repo. None means ambient auth.
+        if is_override:
+            read_candidates = [(self_login, self_review["token"])]
+        elif developers:
+            read_candidates = [(d["login"], d["token"]) for d in developers]
+        else:
+            read_candidates = [("ambient gh auth", None)]
         try:
-            prs = list_open_prs(repo, token=repo_read_token)
-        except subprocess.CalledProcessError as e:
-            log(f"[{repo}] gh pr list failed: {e}")
+            repo_read_token, prs = list_open_prs_with_fallback(
+                repo, read_candidates
+            )
+        except subprocess.CalledProcessError:
+            log(f"[{repo}] skip: no configured token could list its PRs",
+                level="error")
             continue
 
         for pr in prs:
@@ -909,20 +942,21 @@ def main() -> int:
             # An override repo always posts as the operator's own self_token,
             # bypassing the developer rotation and the author-fallback rule.
             if is_override:
-                selection = {"kind": "self_override", "developer": None}
+                selection_kind = "self_override"
                 candidates = [
                     {"login": self_login, "token": self_review["token"]}
                 ]
             else:
-                selection = select_reviewer(pr, developers)
-                candidates = reviewer_candidates(pr, developers, viewer)
+                selection = reviewer_candidates(pr, developers, viewer)
+                selection_kind = selection["kind"]
+                candidates = selection["candidates"]
             reviewer_login = candidates[0]["login"]
-            if selection["kind"] == "self_override":
+            if selection_kind == "self_override":
                 log(
                     f"[{pr_id}] selected reviewer: {reviewer_login} "
                     "(self-token override)"
                 )
-            elif selection["kind"] == "author_fallback":
+            elif selection_kind == "author_fallback":
                 log(
                     f"[{pr_id}] selected reviewer: {reviewer_login} "
                     "(PR author — no other eligible developer configured)"
@@ -932,7 +966,7 @@ def main() -> int:
 
             # The only eligible reviewer is the PR author and the operator
             # chose to skip rather than downgrade to COMMENT.
-            if selection["kind"] == "author_fallback" and author_fallback == "skip":
+            if selection_kind == "author_fallback" and author_fallback == "skip":
                 log(
                     f"[{pr_id}] skip: only configured developer is the PR "
                     "author and review.author_fallback is 'skip'"

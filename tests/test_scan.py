@@ -5,6 +5,7 @@ Run from the repo root with:
 """
 
 import os
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -271,43 +272,6 @@ class ValidateSelfTokenTest(unittest.TestCase):
         self.assertIn("self_token", warned)
 
 
-class SelectReviewerTest(unittest.TestCase):
-    DEVS = [
-        {"login": "alice", "token": "t-alice"},
-        {"login": "bob", "token": "t-bob"},
-    ]
-
-    @staticmethod
-    def _pr(author):
-        return {"author": {"login": author}}
-
-    def test_no_developers_falls_back_to_ambient(self):
-        result = scan.select_reviewer(self._pr("carol"), [])
-        self.assertEqual(result, {"kind": "ambient", "developer": None})
-
-    def test_first_non_author_developer_in_config_order(self):
-        result = scan.select_reviewer(self._pr("carol"), self.DEVS)
-        self.assertEqual(result["kind"], "developer")
-        self.assertEqual(result["developer"], self.DEVS[0])
-
-    def test_skips_author_and_picks_next_developer(self):
-        result = scan.select_reviewer(self._pr("alice"), self.DEVS)
-        self.assertEqual(result["kind"], "developer")
-        self.assertEqual(result["developer"], self.DEVS[1])
-
-    def test_all_developers_are_author_signals_fallback(self):
-        only_alice = [{"login": "alice", "token": "t-alice"}]
-        result = scan.select_reviewer(self._pr("alice"), only_alice)
-        self.assertEqual(result["kind"], "author_fallback")
-        self.assertEqual(result["developer"], only_alice[0])
-
-    def test_skip_authors_is_not_consulted(self):
-        """A developer is selectable even if their login is a skip_author —
-        select_reviewer takes no skip list and must not filter on one."""
-        result = scan.select_reviewer(self._pr("carol"), self.DEVS)
-        self.assertEqual(result["developer"]["login"], "alice")
-
-
 class DecideEventTest(unittest.TestCase):
     """decide_event decides the GitHub event against the *selected reviewer*,
     not a single global viewer."""
@@ -364,34 +328,34 @@ class ReviewerCandidatesTest(unittest.TestCase):
     def test_no_developers_yields_single_ambient_candidate(self):
         self.assertEqual(
             scan.reviewer_candidates(self._pr("carol"), [], "spectrabot"),
-            [{"login": "spectrabot", "token": None}],
+            {
+                "kind": "ambient",
+                "candidates": [{"login": "spectrabot", "token": None}],
+            },
         )
 
     def test_non_author_developers_in_config_order(self):
-        self.assertEqual(
-            scan.reviewer_candidates(self._pr("carol"), self.DEVS, "viewer"),
-            self.DEVS,
-        )
+        result = scan.reviewer_candidates(self._pr("carol"), self.DEVS, "viewer")
+        self.assertEqual(result["kind"], "developer")
+        self.assertEqual(result["candidates"], self.DEVS)
 
     def test_pr_author_is_dropped_from_candidates(self):
-        self.assertEqual(
-            scan.reviewer_candidates(self._pr("alice"), self.DEVS, "viewer"),
-            [{"login": "bob", "token": "t-bob"}],
-        )
+        result = scan.reviewer_candidates(self._pr("alice"), self.DEVS, "viewer")
+        self.assertEqual(result["kind"], "developer")
+        self.assertEqual(result["candidates"], [{"login": "bob", "token": "t-bob"}])
 
-    def test_all_developers_are_author_returns_all(self):
+    def test_all_developers_are_author_returns_all_as_fallback(self):
         """Author-fallback: every dev is the author, so all are candidates."""
         only_alice = [{"login": "alice", "token": "t-alice"}]
-        self.assertEqual(
-            scan.reviewer_candidates(self._pr("alice"), only_alice, "viewer"),
-            only_alice,
-        )
+        result = scan.reviewer_candidates(self._pr("alice"), only_alice, "viewer")
+        self.assertEqual(result["kind"], "author_fallback")
+        self.assertEqual(result["candidates"], only_alice)
 
-    def test_first_candidate_matches_select_reviewer(self):
-        pr = self._pr("alice")
-        candidates = scan.reviewer_candidates(pr, self.DEVS, "viewer")
-        selection = scan.select_reviewer(pr, self.DEVS)
-        self.assertEqual(candidates[0], selection["developer"])
+    def test_skip_authors_is_not_consulted(self):
+        """reviewer_candidates takes no skip list — a developer is still
+        selectable even if their login also appears in skip_authors."""
+        result = scan.reviewer_candidates(self._pr("carol"), self.DEVS, "viewer")
+        self.assertEqual(result["candidates"][0]["login"], "alice")
 
 
 class ReviewOnePrTest(unittest.TestCase):
@@ -761,6 +725,160 @@ class SecretRedactionTest(unittest.TestCase):
         printed_text = " ".join(str(c.args[0]) for c in printed.call_args_list)
         self.assertNotIn("ghp_leaked", printed_text)
         self.assertIn("***", printed_text)
+
+
+class ListOpenPrsWithFallbackTest(unittest.TestCase):
+    """The read path mirrors the posting path's fall-through: one developer
+    losing access to a repo must not drop that repo from the whole scan."""
+
+    CANDIDATES = [("alice", "t-alice"), ("bob", "t-bob")]
+
+    @staticmethod
+    def _auth_error():
+        return subprocess.CalledProcessError(1, ["gh", "pr", "list"])
+
+    def test_first_working_token_is_used(self):
+        with mock.patch.object(
+            scan, "list_open_prs", return_value=[{"number": 1}]
+        ) as listed:
+            token, prs = scan.list_open_prs_with_fallback(
+                "o/r", self.CANDIDATES
+            )
+        self.assertEqual(token, "t-alice")
+        self.assertEqual(prs, [{"number": 1}])
+        self.assertEqual(listed.call_count, 1)
+
+    def test_falls_through_to_next_token_on_auth_failure(self):
+        with mock.patch.object(
+            scan, "list_open_prs",
+            side_effect=[self._auth_error(), [{"number": 2}]],
+        ) as listed:
+            token, prs = scan.list_open_prs_with_fallback(
+                "o/r", self.CANDIDATES
+            )
+        self.assertEqual(token, "t-bob")
+        self.assertEqual(prs, [{"number": 2}])
+        self.assertEqual(listed.call_count, 2)
+
+    def test_raises_when_every_token_fails(self):
+        with mock.patch.object(
+            scan, "list_open_prs",
+            side_effect=[self._auth_error(), self._auth_error()],
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                scan.list_open_prs_with_fallback("o/r", self.CANDIDATES)
+
+
+class MainOrchestrationTest(unittest.TestCase):
+    """Integration coverage for main()'s wiring: override branching, the
+    author-fallback skip, repo-set dedup, and reviewer-candidate selection."""
+
+    DEVS = [
+        {"login": "alice", "token": "t-alice"},
+        {"login": "bob", "token": "t-bob"},
+    ]
+
+    @staticmethod
+    def _pr(number, author, draft=False):
+        return {
+            "number": number,
+            "headRefOid": f"sha{number}",
+            "isDraft": draft,
+            "author": {"login": author},
+            "reviewDecision": "REVIEW_REQUIRED",
+            "title": f"PR {number}",
+            "url": f"https://example.test/{number}",
+        }
+
+    def _run_main(self, cfg, prs_by_repo, developers=None, self_login=None):
+        """Drive main() with the gh/engine boundary mocked. Returns
+        (return_code, reviewed) where reviewed is a list of
+        (repo, pr_number, [candidate logins]) for each review_one_pr call."""
+        developers = self.DEVS if developers is None else developers
+        reviewed = []
+
+        def fake_review(repo, pr, prompt_text, cfg_, candidates, read_tok, dry):
+            reviewed.append(
+                (repo, pr["number"], [c["login"] for c in candidates])
+            )
+            return {
+                "verdict": "comment",
+                "inline_count": 0,
+                "reviewer": candidates[0]["login"],
+            }
+
+        prompt = mock.Mock()
+        prompt.read_text.return_value = "prompt"
+        with mock.patch.object(sys, "argv", ["spectrabot"]), \
+             mock.patch.object(scan, "prune_old_logs"), \
+             mock.patch.object(scan, "log"), \
+             mock.patch.object(scan, "load_config", return_value=cfg), \
+             mock.patch.object(
+                 scan, "validate_developers", return_value=developers), \
+             mock.patch.object(
+                 scan, "validate_self_token", return_value=self_login), \
+             mock.patch.object(scan, "load_state", return_value={}), \
+             mock.patch.object(scan, "save_state"), \
+             mock.patch.object(
+                 scan, "viewer_login", return_value="spectrabot"), \
+             mock.patch.object(scan, "PROMPT_PATH", prompt), \
+             mock.patch.object(
+                 scan, "list_open_prs",
+                 side_effect=lambda repo, token=None: prs_by_repo.get(repo, [])), \
+             mock.patch.object(
+                 scan, "review_one_pr", side_effect=fake_review):
+            rc = scan.main()
+        return rc, reviewed
+
+    def test_normal_multi_developer_pr_reviewed_by_non_author(self):
+        cfg = {
+            "github": {"repos": ["o/app"], "developers": self.DEVS},
+            "review": {},
+        }
+        rc, reviewed = self._run_main(cfg, {"o/app": [self._pr(1, "carol")]})
+        self.assertEqual(rc, 0)
+        self.assertEqual(reviewed, [("o/app", 1, ["alice", "bob"])])
+
+    def test_author_fallback_skip_excludes_own_pr(self):
+        only_alice = [{"login": "alice", "token": "t-alice"}]
+        cfg = {
+            "github": {"repos": ["o/app"], "developers": only_alice},
+            "review": {"author_fallback": "skip"},
+        }
+        prs = {"o/app": [self._pr(1, "alice"), self._pr(2, "carol")]}
+        rc, reviewed = self._run_main(cfg, prs, developers=only_alice)
+        self.assertEqual(rc, 0)
+        # PR 1 (authored by the only developer) is skipped; PR 2 is reviewed.
+        self.assertEqual(reviewed, [("o/app", 2, ["alice"])])
+
+    def test_override_repo_uses_self_token_and_is_scanned(self):
+        cfg = {
+            "github": {"repos": ["o/app"], "developers": self.DEVS},
+            "review": {
+                "self_token": "t-self",
+                "self_review_repos": ["o/infra"],
+            },
+        }
+        prs = {
+            "o/app": [self._pr(1, "carol")],
+            "o/infra": [self._pr(2, "dave")],
+        }
+        rc, reviewed = self._run_main(cfg, prs, self_login="operator")
+        self.assertEqual(rc, 0)
+        # o/infra is reviewed under the self_token even though it is absent
+        # from [github] repos; o/app keeps the developer rotation.
+        self.assertEqual(
+            reviewed,
+            [("o/app", 1, ["alice", "bob"]), ("o/infra", 2, ["operator"])],
+        )
+
+    def test_no_developers_falls_back_to_ambient_identity(self):
+        cfg = {"github": {"repos": ["o/app"]}, "review": {}}
+        rc, reviewed = self._run_main(
+            cfg, {"o/app": [self._pr(1, "carol")]}, developers=[]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(reviewed, [("o/app", 1, ["spectrabot"])])
 
 
 if __name__ == "__main__":
