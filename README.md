@@ -170,8 +170,9 @@ self_review_repos = []
 # stack of PRs lands at once. Set to 0 for no cap.
 max_prs_per_scan = 10
 
-# Skip PRs whose unified diff exceeds this many lines (too big to review
-# meaningfully in one shot). 0 disables the limit.
+# PRs whose unified diff exceeds this many lines are too big to review in one
+# shot — SpectraBot posts a short "your PR is huge" COMMENT instead of a full
+# review. 0 disables the limit.
 max_diff_lines = 4000
 
 [engine]
@@ -186,11 +187,12 @@ extra_args = []
 timeout_seconds = 600
 ```
 
-The engine is invoked non-interactively per PR: `claude -p <prompt>`,
-`codex exec <prompt>`, or `opencode run <prompt>`. The review prompt is
-identical across engines; only the JSON block in the engine's stdout is
-consumed, so incidental log output is tolerated. If a new engine emits noisy
-stdout that confuses parsing, use `extra_args` to quiet it.
+The engine is invoked non-interactively per PR. `claude` and `codex` receive
+the prompt on stdin (`claude -p`, `codex exec`); `opencode run` takes it as an
+argument. The review prompt is identical across engines; only the JSON block
+in the engine's stdout is consumed, so incidental log output is tolerated. If
+a new engine emits noisy stdout that confuses parsing, use `extra_args` to
+quiet it.
 
 A PR is reviewed when **all** of these are true:
 
@@ -199,8 +201,11 @@ A PR is reviewed when **all** of these are true:
 - Not already approved by anyone (`reviewDecision != APPROVED`)
 - Author not in `skip_authors`
 - Not already recorded in the state file (one review per PR, lifetime)
-- Diff is at or below `max_diff_lines`
 - Per-scan cap `max_prs_per_scan` not yet hit
+
+A PR that clears those filters but whose diff exceeds `max_diff_lines` gets a
+short "your PR is huge" COMMENT instead of a full review, and is then recorded
+in state like any reviewed PR.
 
 ### Who posts the review
 
@@ -302,6 +307,18 @@ spectrabot --repo myorg/api --pr 1234 --force --dry-run   # ignore state
 
 `--dry-run` fetches the diff and calls `claude`, so it still costs tokens —
 it just doesn't POST to GitHub.
+
+### Repo cache
+
+SpectraBot keeps a local clone of each scanned repo under
+`$SPECTRABOT_HOME/cache/repos/<owner>/<name>` and produces PR diffs with
+`git diff` rather than the GitHub API. This sidesteps the API's 20,000-line
+diff cap, so large PRs can be reviewed. The first scan of a repo pays a
+one-time `git clone`; later scans only fetch. Disk usage scales with the
+number and size of configured repos — point the cache elsewhere with the
+`SPECTRABOT_REPO_CACHE` environment variable. Clones authenticate with the
+same token used to read the PR (a `[[github.developers]]` token, or the
+ambient `gh` token), so no extra `git` credential setup is needed.
 
 ### Check schedule status
 
@@ -464,6 +481,20 @@ usually helps.
 You can't approve your own PR. SpectraBot already downgrades to `COMMENT` in
 that case; if you still see this, the PR's author login changed (org
 transfer, etc.) and the check doesn't match. Add it to `skip_authors`.
+
+**`could not find pull request diff: HTTP 406 ... diff exceeded the maximum`**
+This came from fetching diffs through the GitHub API, which refuses diffs over
+20,000 lines. SpectraBot now diffs from a local clone instead, so this error
+should no longer occur. If you still see it, you're on an older version —
+update. A PR whose diff exceeds `max_diff_lines` gets a short "your PR is huge"
+comment instead of a full review.
+
+**`git clone`/`fetch` fails in the journal**
+The token used to read the repo can't reach it over `git` — confirm the
+`[[github.developers]]` token (or, for ambient auth, `gh auth token`) has
+`repo` read scope for that repo. Inspect the cache at `$SPECTRABOT_REPO_CACHE`
+(default `~/.spectrabot/cache/repos`); deleting a repo's directory there
+forces a fresh clone next scan.
 
 **Same PR reviewed twice**
 The state file might be missing or unwritable. `ls -l ~/.spectrabot/state/`

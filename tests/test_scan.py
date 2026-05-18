@@ -160,6 +160,44 @@ class GhTokenTest(unittest.TestCase):
         self.assertEqual(g.call_args.kwargs.get("token"), "t-secret")
 
 
+class GitTokenTest(unittest.TestCase):
+    def test_git_without_token_inherits_ambient_env(self):
+        """Omitting token must not pass an env kwarg (ambient git credentials)."""
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"])
+        self.assertNotIn("env", co.call_args.kwargs)
+
+    def test_git_with_token_injects_extraheader(self):
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"], token="t-secret")
+        env = co.call_args.kwargs["env"]
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.extraheader")
+        self.assertTrue(env["GIT_CONFIG_VALUE_0"].startswith("AUTHORIZATION: basic "))
+
+    def test_git_token_is_not_passed_in_argv(self):
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"], token="t-secret")
+        self.assertNotIn("t-secret", co.call_args.args[0])
+
+    def test_git_with_token_leaves_parent_environment_unchanged(self):
+        before = os.environ.get("GIT_CONFIG_COUNT")
+        with mock.patch("scan.subprocess.check_output", return_value="ok"):
+            scan.git(["status"], token="t-secret")
+        self.assertEqual(os.environ.get("GIT_CONFIG_COUNT"), before)
+
+    def test_git_token_env_keeps_other_parent_vars(self):
+        with mock.patch.dict(os.environ, {"SPECTRA_MARKER": "keep"}):
+            with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+                scan.git(["status"], token="t-secret")
+            self.assertEqual(co.call_args.kwargs["env"]["SPECTRA_MARKER"], "keep")
+
+    def test_git_forwards_cwd(self):
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"], cwd=Path("/tmp/repo"))
+        self.assertEqual(co.call_args.kwargs["cwd"], "/tmp/repo")
+
+
 class PostReviewTokenTest(unittest.TestCase):
     def _ok_proc(self):
         return mock.Mock(returncode=0, stdout="", stderr="")
@@ -442,6 +480,209 @@ class ReviewOnePrTest(unittest.TestCase):
         candidates = [{"login": "alice", "token": "t-alice"}]
         result, _, _ = self._run(candidates, dry_run=True)
         self.assertEqual(result["reviewer"], "alice")
+
+    def _run_oversized(self, candidates, dry_run=False, post=None):
+        """Run with a diff that exceeds max_diff_lines (capped at 2 here)."""
+        cfg = {"review": {"mode": "auto", "max_diff_lines": 2}}
+        big_diff = "line\n" * 20
+        with mock.patch.object(
+            scan, "fetch_pr_context", return_value=({"title": "t"}, big_diff)
+        ), mock.patch.object(
+            scan, "invoke_engine"
+        ) as engine, mock.patch.object(
+            scan, "post_review", side_effect=post
+        ) as posted, mock.patch.object(
+            scan, "celebrate_approval"
+        ):
+            result = scan.review_one_pr(
+                "owner/repo", self.PR, "prompt", cfg,
+                candidates, None, dry_run,
+            )
+        return result, posted, engine
+
+    def test_oversized_pr_posts_size_comment_without_running_engine(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        result, posted, engine = self._run_oversized(candidates)
+        engine.assert_not_called()
+        payload = posted.call_args.args[2]
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload["body"], scan.OVERSIZED_PR_COMMENT)
+        self.assertEqual(result["verdict"], "too-large")
+
+    def test_oversized_pr_dry_run_posts_nothing(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        result, posted, _ = self._run_oversized(candidates, dry_run=True)
+        posted.assert_not_called()
+        self.assertEqual(result["verdict"], "too-large")
+
+    def test_prompt_too_large_routes_to_size_comment(self):
+        """An engine rejecting an over-argv-limit prompt is handled like an
+        oversized PR — a size comment — not an unhandled crash."""
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        with mock.patch.object(
+            scan, "fetch_pr_context", return_value=({"title": "t"}, "diff\n")
+        ), mock.patch.object(
+            scan, "invoke_engine",
+            side_effect=scan.PromptTooLargeError("prompt too big"),
+        ), mock.patch.object(
+            scan, "post_review"
+        ) as posted, mock.patch.object(
+            scan, "celebrate_approval"
+        ):
+            result = scan.review_one_pr(
+                "owner/repo", self.PR, "prompt", self.CFG,
+                candidates, None, False,
+            )
+        payload = posted.call_args.args[2]
+        self.assertEqual(payload["body"], scan.OVERSIZED_PR_COMMENT)
+        self.assertEqual(payload["comments"], [])
+        self.assertEqual(result["verdict"], "too-large")
+
+
+class InvokeEngineTest(unittest.TestCase):
+    """The prompt (which carries the unified diff) must reach `stdin: True`
+    engines on stdin and `opencode` in argv. Routing it through argv for a
+    large diff is exactly the MAX_ARG_STRLEN failure this PR fixes."""
+
+    META = {"title": "t"}
+    DIFF = "UNIQUE-DIFF-MARKER"
+
+    def _invoke(self, engine_name):
+        cfg = {"engine": {"name": engine_name, "bin": f"/usr/bin/{engine_name}"}}
+        proc = mock.Mock(
+            returncode=0, stdout='{"recommendation": "comment"}', stderr=""
+        )
+        with mock.patch("scan.subprocess.run", return_value=proc) as run:
+            scan.invoke_engine("prompt", self.META, self.DIFF, cfg)
+        return run.call_args
+
+    def test_claude_receives_prompt_on_stdin(self):
+        call = self._invoke("claude")
+        self.assertIn(self.DIFF, call.kwargs["input"])
+        self.assertNotIn(self.DIFF, " ".join(call.args[0]))
+
+    def test_codex_receives_prompt_on_stdin(self):
+        call = self._invoke("codex")
+        self.assertIn(self.DIFF, call.kwargs["input"])
+        self.assertNotIn(self.DIFF, " ".join(call.args[0]))
+
+    def test_opencode_receives_prompt_in_argv(self):
+        call = self._invoke("opencode")
+        self.assertIsNone(call.kwargs["input"])
+        self.assertTrue(any(self.DIFF in arg for arg in call.args[0]))
+
+    def test_unknown_engine_raises(self):
+        cfg = {"engine": {"name": "bogus"}}
+        with self.assertRaises(RuntimeError):
+            scan.invoke_engine("prompt", self.META, self.DIFF, cfg)
+
+    def test_argv_engine_over_limit_raises_prompt_too_large(self):
+        """An opencode prompt past the argv limit raises before exec, instead
+        of crashing with an opaque OSError('Argument list too long')."""
+        cfg = {"engine": {"name": "opencode", "bin": "/usr/bin/opencode"}}
+        huge_diff = "x" * (scan.ARGV_PROMPT_LIMIT + 1)
+        with mock.patch("scan.subprocess.run") as run:
+            with self.assertRaises(scan.PromptTooLargeError):
+                scan.invoke_engine("prompt", self.META, huge_diff, cfg)
+        run.assert_not_called()
+
+    def test_stdin_engine_is_not_limited_by_argv_size(self):
+        """A huge prompt is fine for a stdin engine — it never touches argv."""
+        cfg = {"engine": {"name": "claude", "bin": "/usr/bin/claude"}}
+        huge_diff = "x" * (scan.ARGV_PROMPT_LIMIT + 1)
+        proc = mock.Mock(
+            returncode=0, stdout='{"recommendation": "comment"}', stderr=""
+        )
+        with mock.patch("scan.subprocess.run", return_value=proc) as run:
+            scan.invoke_engine("prompt", self.META, huge_diff, cfg)
+        run.assert_called_once()
+
+
+class GitPrDiffTest(unittest.TestCase):
+    """git_pr_diff fetches the PR head and base into fixed refs and diffs them
+    with the three-dot (merge-base) form."""
+
+    def test_fetch_refspecs_and_three_dot_diff(self):
+        calls = []
+
+        def fake_git(args, cwd=None, token=None):
+            calls.append(args)
+            return "THE-DIFF" if args and args[0] == "diff" else ""
+
+        with mock.patch.object(scan, "_ambient_gh_token", return_value=None), \
+             mock.patch.object(
+                 scan, "ensure_repo_cache", return_value=Path("/cache/owner/repo")
+             ), \
+             mock.patch.object(scan, "git", side_effect=fake_git):
+            out = scan.git_pr_diff("owner/repo", 7, "main")
+
+        self.assertEqual(out, "THE-DIFF")
+        fetch = next(a for a in calls if a[0] == "fetch")
+        self.assertIn("+refs/pull/7/head:refs/spectrabot/pr-head", fetch)
+        self.assertIn("+refs/heads/main:refs/spectrabot/base", fetch)
+        diff = next(a for a in calls if a[0] == "diff")
+        self.assertEqual(
+            diff, ["diff", "refs/spectrabot/base...refs/spectrabot/pr-head"]
+        )
+
+    def test_refs_are_fixed_and_independent_of_pr_number(self):
+        """Refs don't embed the PR number, so they don't accumulate per PR."""
+        fetched = []
+
+        def fake_git(args, cwd=None, token=None):
+            if args and args[0] == "fetch":
+                fetched.append(args)
+            return ""
+
+        with mock.patch.object(scan, "_ambient_gh_token", return_value=None), \
+             mock.patch.object(
+                 scan, "ensure_repo_cache", return_value=Path("/cache")
+             ), \
+             mock.patch.object(scan, "git", side_effect=fake_git):
+            scan.git_pr_diff("owner/repo", 7, "main")
+            scan.git_pr_diff("owner/repo", 99, "main")
+
+        for fetch in fetched:
+            self.assertTrue(
+                any("refs/spectrabot/pr-head" in part for part in fetch)
+            )
+            self.assertFalse(any("pr-7" in part or "pr-99" in part for part in fetch))
+
+
+class EnsureRepoCacheTest(unittest.TestCase):
+    """A failed clone must not leave a half-written `.git` that later scans
+    accept as a usable cache."""
+
+    def test_existing_cache_is_reused_without_cloning(self):
+        with mock.patch("scan.Path.is_dir", return_value=True), \
+             mock.patch.object(scan, "git") as git:
+            scan.ensure_repo_cache("owner/repo")
+        git.assert_not_called()
+
+    def test_clone_targets_a_temp_path_then_renames_into_place(self):
+        with mock.patch("scan.Path.is_dir", return_value=False), \
+             mock.patch("scan.Path.exists", return_value=False), \
+             mock.patch("scan.Path.mkdir"), \
+             mock.patch.object(scan, "git") as git, \
+             mock.patch("scan.Path.rename") as rename:
+            path = scan.ensure_repo_cache("owner/repo")
+        clone_dest = git.call_args.args[0][-1]
+        self.assertNotEqual(clone_dest, str(path))
+        rename.assert_called_once()
+
+    def test_failed_clone_removes_temp_and_reraises(self):
+        with mock.patch("scan.Path.is_dir", return_value=False), \
+             mock.patch("scan.Path.exists", return_value=False), \
+             mock.patch("scan.Path.mkdir"), \
+             mock.patch.object(
+                 scan, "git", side_effect=subprocess.CalledProcessError(1, "git")
+             ), \
+             mock.patch("scan.shutil.rmtree") as rmtree, \
+             mock.patch("scan.Path.rename") as rename:
+            with self.assertRaises(subprocess.CalledProcessError):
+                scan.ensure_repo_cache("owner/repo")
+        rmtree.assert_called_once()
+        rename.assert_not_called()
 
 
 class FetchSpectrabotThreadsTest(unittest.TestCase):
