@@ -335,12 +335,24 @@ def ensure_repo_cache(repo: str, token: str | None = None) -> Path:
     """Return the local cache clone of `repo`, cloning it on first encounter.
 
     The origin URL is stored token-free; auth for the clone is supplied via
-    `_git_env` for that one invocation only."""
+    `_git_env` for that one invocation only.
+
+    The clone lands in a temp directory and is atomically renamed into place on
+    success, so an interrupted or failed clone never leaves a half-written
+    `.git` behind for later scans to fetch into and fail on."""
     path = repo_cache_path(repo)
     if (path / ".git").is_dir():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    git(["clone", f"https://github.com/{repo}.git", str(path)], token=token)
+    tmp = path.parent / f".{path.name}.cloning-{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    try:
+        git(["clone", f"https://github.com/{repo}.git", str(tmp)], token=token)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    tmp.rename(path)
     return path
 
 
@@ -360,8 +372,11 @@ def git_pr_diff(
         if token:
             register_secret(token)
     path = ensure_repo_cache(repo, token)
-    pr_ref = f"refs/spectrabot/pr-{pr_number}"
-    base_loc = f"refs/spectrabot/base-{pr_number}"
+    # Fixed ref names, reused across every PR in this repo: the diff is computed
+    # immediately after the fetch, so there's no need to keep per-PR refs around
+    # — that would grow the cache clone's ref store unboundedly over time.
+    pr_ref = "refs/spectrabot/pr-head"
+    base_loc = "refs/spectrabot/base"
     git(
         [
             "fetch", "--no-tags", "origin",
@@ -860,6 +875,7 @@ def review_one_pr(
             "commit_id": head_sha,
             "event": "COMMENT",
             "body": OVERSIZED_PR_COMMENT,
+            "comments": [],
         }
         log(f"  diff too large ({diff_lines} > {max_diff} lines) — posting size comment")
     else:

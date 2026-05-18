@@ -516,6 +516,80 @@ class ReviewOnePrTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "too-large")
 
 
+class InvokeEngineTest(unittest.TestCase):
+    """The prompt (which carries the unified diff) must reach `stdin: True`
+    engines on stdin and `opencode` in argv. Routing it through argv for a
+    large diff is exactly the MAX_ARG_STRLEN failure this PR fixes."""
+
+    META = {"title": "t"}
+    DIFF = "UNIQUE-DIFF-MARKER"
+
+    def _invoke(self, engine_name):
+        cfg = {"engine": {"name": engine_name, "bin": f"/usr/bin/{engine_name}"}}
+        proc = mock.Mock(
+            returncode=0, stdout='{"recommendation": "comment"}', stderr=""
+        )
+        with mock.patch("scan.subprocess.run", return_value=proc) as run:
+            scan.invoke_engine("prompt", self.META, self.DIFF, cfg)
+        return run.call_args
+
+    def test_claude_receives_prompt_on_stdin(self):
+        call = self._invoke("claude")
+        self.assertIn(self.DIFF, call.kwargs["input"])
+        self.assertNotIn(self.DIFF, " ".join(call.args[0]))
+
+    def test_codex_receives_prompt_on_stdin(self):
+        call = self._invoke("codex")
+        self.assertIn(self.DIFF, call.kwargs["input"])
+        self.assertNotIn(self.DIFF, " ".join(call.args[0]))
+
+    def test_opencode_receives_prompt_in_argv(self):
+        call = self._invoke("opencode")
+        self.assertIsNone(call.kwargs["input"])
+        self.assertTrue(any(self.DIFF in arg for arg in call.args[0]))
+
+    def test_unknown_engine_raises(self):
+        cfg = {"engine": {"name": "bogus"}}
+        with self.assertRaises(RuntimeError):
+            scan.invoke_engine("prompt", self.META, self.DIFF, cfg)
+
+
+class EnsureRepoCacheTest(unittest.TestCase):
+    """A failed clone must not leave a half-written `.git` that later scans
+    accept as a usable cache."""
+
+    def test_existing_cache_is_reused_without_cloning(self):
+        with mock.patch("scan.Path.is_dir", return_value=True), \
+             mock.patch.object(scan, "git") as git:
+            scan.ensure_repo_cache("owner/repo")
+        git.assert_not_called()
+
+    def test_clone_targets_a_temp_path_then_renames_into_place(self):
+        with mock.patch("scan.Path.is_dir", return_value=False), \
+             mock.patch("scan.Path.exists", return_value=False), \
+             mock.patch("scan.Path.mkdir"), \
+             mock.patch.object(scan, "git") as git, \
+             mock.patch("scan.Path.rename") as rename:
+            path = scan.ensure_repo_cache("owner/repo")
+        clone_dest = git.call_args.args[0][-1]
+        self.assertNotEqual(clone_dest, str(path))
+        rename.assert_called_once()
+
+    def test_failed_clone_removes_temp_and_reraises(self):
+        with mock.patch("scan.Path.is_dir", return_value=False), \
+             mock.patch("scan.Path.exists", return_value=False), \
+             mock.patch("scan.Path.mkdir"), \
+             mock.patch.object(
+                 scan, "git", side_effect=subprocess.CalledProcessError(1, "git")
+             ), \
+             mock.patch("scan.shutil.rmtree") as rmtree, \
+             mock.patch("scan.Path.rename") as rename:
+            with self.assertRaises(subprocess.CalledProcessError):
+                scan.ensure_repo_cache("owner/repo")
+        rmtree.assert_called_once()
+        rename.assert_not_called()
+
+
 class FetchSpectrabotThreadsTest(unittest.TestCase):
     """fetch_spectrabot_threads matches threads opened by any configured
     developer login, not a single viewer."""
