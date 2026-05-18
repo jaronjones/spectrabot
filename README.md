@@ -340,11 +340,26 @@ launchctl kickstart -k gui/$UID/com.spectrabot.scan
 
 ### Change scan frequency
 
+The timer ships at a 5-minute interval (`OnUnitInactiveSec=5min`).
+
 - **Linux:** edit `~/.config/systemd/user/spectrabot.timer`, change
-  `OnUnitInactiveSec=10min`, then `systemctl --user daemon-reload &&
+  `OnUnitInactiveSec=5min`, then `systemctl --user daemon-reload &&
   systemctl --user restart spectrabot.timer`.
 - **macOS:** edit `~/Library/LaunchAgents/com.spectrabot.scan.plist`, change
   `StartInterval` (seconds), then `launchctl unload <plist> && launchctl load <plist>`.
+
+On Linux, `OnUnitInactiveSec` is measured from when the **previous scan
+finishes**, not on a fixed wall clock — so the real gap between scans is the
+configured interval *plus* each scan's runtime (typically a few seconds).
+`OnUnitInactiveSec=5min` therefore means "5 minutes after the last scan
+ends," not "every scan starts on a :00/:05/:10 boundary." For a fixed
+wall-clock cadence regardless of scan duration, replace `OnUnitInactiveSec`
+with `OnCalendar` instead — e.g. `OnCalendar=*:0/5` for every 5 minutes on the
+clock — then `daemon-reload` and restart the timer as above.
+
+Editing the installed timer takes effect immediately, but `./install.sh`
+overwrites it from `service/spectrabot.timer`. To make an interval change
+survive reinstalls, edit `service/spectrabot.timer` in this repo as well.
 
 ### Pause / resume
 

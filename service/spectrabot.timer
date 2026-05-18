@@ -3,9 +3,9 @@ Description=Run SpectraBot scan periodically
 Requires=spectrabot.service
 
 [Timer]
-# First run 2 minutes after boot, then every 10 minutes after the last finish.
+# First run 2 minutes after boot, then every 5 minutes after the last finish.
 OnBootSec=2min
-OnUnitInactiveSec=10min
+OnUnitInactiveSec=5min
 # If the machine was off when a tick was due, run on next start.
 Persistent=true
 Unit=spectrabot.service
