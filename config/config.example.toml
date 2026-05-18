@@ -7,6 +7,24 @@ repos = [
   # "octocat/hello-world",
 ]
 
+# Developer credentials SpectraBot can post reviews as. Each PR is reviewed by
+# the first developer in this list whose login is NOT the PR author — so no one
+# reviews their own PR ("first eligible, not the author"). List your team in
+# the order you want them tried.
+#
+# Leave this section out entirely (or empty) to keep single-user behavior:
+# SpectraBot reviews with whatever identity `gh` is already authenticated as.
+#
+# Each token needs `repo` scope, plus SSO authorization for SSO-protected orgs.
+# Keep this file private: chmod 600 ~/.spectrabot/config.toml
+# [[github.developers]]
+# login = "alice"
+# token = "ghp_REPLACE_ME_ALICE"
+#
+# [[github.developers]]
+# login = "bob"
+# token = "ghp_REPLACE_ME_BOB"
+
 [review]
 # How to translate the model's recommendation into a GitHub review event.
 #   "auto"    = approve / request-changes / comment based on the verdict
@@ -17,6 +35,24 @@ mode = "auto"
 # Note: GitHub blocks approving your own PR, so when you authored a PR
 # SpectraBot automatically downgrades the event to COMMENT even in "auto" mode.
 skip_authors = []
+
+# What to do when every configured [[github.developers]] is the PR's own
+# author, so no one is eligible to post a non-self review:
+#   "comment" = post the review as comment-only (default)
+#   "skip"    = skip the PR entirely, posting nothing
+author_fallback = "comment"
+
+# Self-token repo override. Repos listed in self_review_repos are reviewed
+# with self_token — the operator's own GitHub token — instead of the
+# [[github.developers]] rotation. Use this for repos you want reviewed under
+# your own identity. self_review_repos defaults to empty, which leaves the
+# multi-developer behavior unchanged. If self_review_repos is non-empty,
+# self_token must be set or SpectraBot aborts at startup.
+#
+# self_token needs `repo` scope (plus SSO authorization for SSO-protected
+# orgs), like every developer token. Keep this file private: chmod 600.
+# self_token = "ghp_REPLACE_ME_SELF"
+self_review_repos = []
 
 # Hard cap on PRs reviewed in a single scan. Protects against runaway token
 # spend if many PRs land at once. Set to 0 for no cap.

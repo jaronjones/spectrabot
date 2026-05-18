@@ -41,6 +41,14 @@ counts.
 - No Blockers, any **Critical** → 🔄 **Approve with changes** (block merge until Criticals are addressed)
 - Only High / Medium / NitPick → ✅ **Approve**
 
+**Never approve your own PR.** When the target is a PR, compare the invoking
+GitHub user (`gh api user --jq .login`) against the PR author (`author.login`
+from `gh pr view`). If they match, you authored the PR: you may not submit an
+APPROVE. The review event is downgraded to **COMMENT** regardless of the
+category counts — post the review as a comment, never an approval. Still show
+the recommendation the rules above produce so the author sees where the PR
+stands; only the GitHub review event changes.
+
 If you find yourself wanting to recommend differently than the rule produces,
 you've miscategorized something — re-grade the findings instead of overriding
 the rule.
