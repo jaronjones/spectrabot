@@ -58,8 +58,9 @@ self_review_repos = []
 # spend if many PRs land at once. Set to 0 for no cap.
 max_prs_per_scan = 10
 
-# If the unified diff exceeds this many lines, skip the PR (too large to
-# review meaningfully in one shot). 0 = no limit.
+# If the unified diff exceeds this many lines, the PR is too large to review
+# in one shot — SpectraBot posts a short "your PR is huge" COMMENT instead of
+# a full review. 0 = no limit (always attempt a full review).
 max_diff_lines = 4000
 
 [engine]

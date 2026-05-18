@@ -160,6 +160,44 @@ class GhTokenTest(unittest.TestCase):
         self.assertEqual(g.call_args.kwargs.get("token"), "t-secret")
 
 
+class GitTokenTest(unittest.TestCase):
+    def test_git_without_token_inherits_ambient_env(self):
+        """Omitting token must not pass an env kwarg (ambient git credentials)."""
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"])
+        self.assertNotIn("env", co.call_args.kwargs)
+
+    def test_git_with_token_injects_extraheader(self):
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"], token="t-secret")
+        env = co.call_args.kwargs["env"]
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.extraheader")
+        self.assertTrue(env["GIT_CONFIG_VALUE_0"].startswith("AUTHORIZATION: basic "))
+
+    def test_git_token_is_not_passed_in_argv(self):
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"], token="t-secret")
+        self.assertNotIn("t-secret", co.call_args.args[0])
+
+    def test_git_with_token_leaves_parent_environment_unchanged(self):
+        before = os.environ.get("GIT_CONFIG_COUNT")
+        with mock.patch("scan.subprocess.check_output", return_value="ok"):
+            scan.git(["status"], token="t-secret")
+        self.assertEqual(os.environ.get("GIT_CONFIG_COUNT"), before)
+
+    def test_git_token_env_keeps_other_parent_vars(self):
+        with mock.patch.dict(os.environ, {"SPECTRA_MARKER": "keep"}):
+            with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+                scan.git(["status"], token="t-secret")
+            self.assertEqual(co.call_args.kwargs["env"]["SPECTRA_MARKER"], "keep")
+
+    def test_git_forwards_cwd(self):
+        with mock.patch("scan.subprocess.check_output", return_value="ok") as co:
+            scan.git(["status"], cwd=Path("/tmp/repo"))
+        self.assertEqual(co.call_args.kwargs["cwd"], "/tmp/repo")
+
+
 class PostReviewTokenTest(unittest.TestCase):
     def _ok_proc(self):
         return mock.Mock(returncode=0, stdout="", stderr="")
@@ -442,6 +480,40 @@ class ReviewOnePrTest(unittest.TestCase):
         candidates = [{"login": "alice", "token": "t-alice"}]
         result, _, _ = self._run(candidates, dry_run=True)
         self.assertEqual(result["reviewer"], "alice")
+
+    def _run_oversized(self, candidates, dry_run=False, post=None):
+        """Run with a diff that exceeds max_diff_lines (capped at 2 here)."""
+        cfg = {"review": {"mode": "auto", "max_diff_lines": 2}}
+        big_diff = "line\n" * 20
+        with mock.patch.object(
+            scan, "fetch_pr_context", return_value=({"title": "t"}, big_diff)
+        ), mock.patch.object(
+            scan, "invoke_engine"
+        ) as engine, mock.patch.object(
+            scan, "post_review", side_effect=post
+        ) as posted, mock.patch.object(
+            scan, "celebrate_approval"
+        ):
+            result = scan.review_one_pr(
+                "owner/repo", self.PR, "prompt", cfg,
+                candidates, None, dry_run,
+            )
+        return result, posted, engine
+
+    def test_oversized_pr_posts_size_comment_without_running_engine(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        result, posted, engine = self._run_oversized(candidates)
+        engine.assert_not_called()
+        payload = posted.call_args.args[2]
+        self.assertEqual(payload["event"], "COMMENT")
+        self.assertEqual(payload["body"], scan.OVERSIZED_PR_COMMENT)
+        self.assertEqual(result["verdict"], "too-large")
+
+    def test_oversized_pr_dry_run_posts_nothing(self):
+        candidates = [{"login": "alice", "token": "t-alice"}]
+        result, posted, _ = self._run_oversized(candidates, dry_run=True)
+        posted.assert_not_called()
+        self.assertEqual(result["verdict"], "too-large")
 
 
 class FetchSpectrabotThreadsTest(unittest.TestCase):

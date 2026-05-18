@@ -9,6 +9,7 @@ once. Designed to be invoked on a schedule (systemd timer / launchd).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import random
@@ -31,6 +32,9 @@ CONFIG_PATH = Path(
 STATE_PATH = Path(
     os.environ.get("SPECTRABOT_STATE", SPECTRABOT_HOME / "state" / "reviewed.json")
 ).expanduser()
+REPO_CACHE = Path(
+    os.environ.get("SPECTRABOT_REPO_CACHE", SPECTRABOT_HOME / "cache" / "repos")
+).expanduser()
 LIB_DIR = Path(__file__).resolve().parent
 PROMPT_PATH = LIB_DIR / "review_prompt.md"
 
@@ -40,6 +44,9 @@ LOG_DIR = Path(
 LOG_RETENTION_DAYS = 7
 CHUCK_NORRIS_API = "https://api.chucknorris.io/jokes/random"
 JOKE_CATEGORIES = ("dev", "science")
+
+# Posted as a COMMENT review when a PR's diff exceeds `max_diff_lines`.
+OVERSIZED_PR_COMMENT = "Bro, your PR is freaking huge - Love Spectrabot"
 
 _USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 _ANSI = {
@@ -279,6 +286,94 @@ def gh_json(args: list[str], token: str | None = None) -> object:
     return json.loads(out) if out else None
 
 
+def _git_env(token: str | None) -> dict | None:
+    """Environment for a git subprocess. When `token` is set, return a copy of
+    the parent environment with an `http.extraheader` Authorization header
+    injected via GIT_CONFIG_* — this keeps the token out of argv and out of the
+    on-disk `.git/config`. When `token` is None, return None so the subprocess
+    inherits the parent environment unchanged (ambient git credentials)."""
+    if not token:
+        return None
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraheader",
+        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+    }
+
+
+def _ambient_gh_token() -> str | None:
+    """The token `gh` is currently authenticated with. Used so local git
+    operations authenticate without a separate `gh auth setup-git` step (and
+    regardless of whether `gh` is configured for the ssh or https protocol).
+    Returns None when `gh` has no usable token."""
+    try:
+        return subprocess.check_output(
+            ["gh", "auth", "token"], text=True
+        ).strip() or None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def git(args: list[str], cwd: Path | None = None, token: str | None = None) -> str:
+    env = _git_env(token)
+    kwargs: dict = {"text": True}
+    if cwd is not None:
+        kwargs["cwd"] = str(cwd)
+    if env is not None:
+        kwargs["env"] = env
+    return subprocess.check_output(["git", *args], **kwargs)
+
+
+def repo_cache_path(repo: str) -> Path:
+    owner, name = repo.split("/", 1)
+    return REPO_CACHE / owner / name
+
+
+def ensure_repo_cache(repo: str, token: str | None = None) -> Path:
+    """Return the local cache clone of `repo`, cloning it on first encounter.
+
+    The origin URL is stored token-free; auth for the clone is supplied via
+    `_git_env` for that one invocation only."""
+    path = repo_cache_path(repo)
+    if (path / ".git").is_dir():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    git(["clone", f"https://github.com/{repo}.git", str(path)], token=token)
+    return path
+
+
+def git_pr_diff(
+    repo: str, pr_number: int, base_ref: str, token: str | None = None
+) -> str:
+    """Produce a PR's unified diff from the local repo cache.
+
+    Fetches the PR head (`refs/pull/<N>/head`, present on the base repo even
+    for fork PRs) and the base branch, then diffs them with the three-dot
+    (merge-base) form GitHub's own PR diff uses. Unlike `gh pr diff`, this has
+    no 20,000-line cap."""
+    # Per-repo read token, or — for ambient `gh` auth — the token `gh` itself
+    # holds, so git authenticates the same way `gh pr diff` used to.
+    if not token:
+        token = _ambient_gh_token()
+        if token:
+            register_secret(token)
+    path = ensure_repo_cache(repo, token)
+    pr_ref = f"refs/spectrabot/pr-{pr_number}"
+    base_loc = f"refs/spectrabot/base-{pr_number}"
+    git(
+        [
+            "fetch", "--no-tags", "origin",
+            f"+refs/pull/{pr_number}/head:{pr_ref}",
+            f"+refs/heads/{base_ref}:{base_loc}",
+        ],
+        cwd=path,
+        token=token,
+    )
+    return git(["diff", f"{base_loc}...{pr_ref}"], cwd=path, token=token)
+
+
 def viewer_login() -> str:
     return gh(["api", "user", "--jq", ".login"]).strip()
 
@@ -428,16 +523,19 @@ def fetch_pr_context(
         ],
         token=token,
     )
-    diff = gh(["pr", "diff", str(pr_number), "--repo", repo], token=token)
+    diff = git_pr_diff(repo, pr_number, meta["baseRefName"], token=token)
     return meta, diff
 
 
-# Non-interactive invocation shape per supported engine CLI. The review prompt
-# is passed as a single argv element between `before` and `after`.
+# Non-interactive invocation shape per supported engine CLI. `before`/`after`
+# bracket the prompt. `stdin` engines receive the prompt piped on stdin — a
+# large diff exceeds the OS single-argv limit (`MAX_ARG_STRLEN`, 128 KiB), so
+# only `opencode` (no stdin mode — `run` takes the message as argv) keeps the
+# prompt in argv and is therefore capped to small diffs.
 ENGINE_SPECS = {
-    "claude": {"before": ["-p"], "after": ["--output-format", "text"]},
-    "codex": {"before": ["exec"], "after": []},
-    "opencode": {"before": ["run"], "after": []},
+    "claude": {"before": ["-p"], "after": ["--output-format", "text"], "stdin": True},
+    "codex": {"before": ["exec"], "after": [], "stdin": True},
+    "opencode": {"before": ["run"], "after": [], "stdin": False},
 }
 
 
@@ -469,8 +567,15 @@ def invoke_engine(prompt_text: str, pr_meta: dict, diff: str, cfg: dict) -> dict
     engine_bin = eng.get("bin") or shutil.which(name) or name
     extra_args = eng.get("extra_args", [])
     timeout = eng.get("timeout_seconds", 600)
-    cmd = [engine_bin, *spec["before"], user_prompt, *spec["after"], *extra_args]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if spec["stdin"]:
+        cmd = [engine_bin, *spec["before"], *spec["after"], *extra_args]
+        stdin_text = user_prompt
+    else:
+        cmd = [engine_bin, *spec["before"], user_prompt, *spec["after"], *extra_args]
+        stdin_text = None
+    res = subprocess.run(
+        cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout
+    )
     if res.returncode != 0:
         raise RuntimeError(
             f"{name} exit {res.returncode}: {res.stderr.strip()[:500]}"
@@ -743,13 +848,26 @@ def review_one_pr(
     max_diff = cfg.get("review", {}).get("max_diff_lines", 4000)
     diff_lines = diff.count("\n")
     if max_diff and diff_lines > max_diff:
-        raise RuntimeError(f"diff too large ({diff_lines} > {max_diff} lines)")
+        # Too big to review meaningfully in one shot. Rather than failing the
+        # PR (which logs an error and re-attempts every scan), post a one-line
+        # COMMENT and record it in state so it's left alone until the head
+        # advances. verdict "too-large" routes through `previously_reviewed_action`
+        # as a terminal skip-until-rescan.
+        verdict = "too-large"
+        event = "COMMENT"
+        payload = {
+            "commit_id": head_sha,
+            "event": "COMMENT",
+            "body": OVERSIZED_PR_COMMENT,
+        }
+        log(f"  diff too large ({diff_lines} > {max_diff} lines) — posting size comment")
+    else:
+        review = invoke_engine(prompt_text, meta, diff, cfg)
+        mode = cfg.get("review", {}).get("mode", "auto")
+        verdict = review.get("recommendation", "comment")
+        event = decide_event(verdict, reviewer_login, pr["author"]["login"], mode)
+        payload = build_review_payload(review, head_sha, event)
 
-    review = invoke_engine(prompt_text, meta, diff, cfg)
-    mode = cfg.get("review", {}).get("mode", "auto")
-    verdict = review.get("recommendation", "comment")
-    event = decide_event(verdict, reviewer_login, pr["author"]["login"], mode)
-    payload = build_review_payload(review, head_sha, event)
     inline_count = len(payload.get("comments", []))
 
     log(f"  verdict={verdict!r} event={event} inline={inline_count}")
