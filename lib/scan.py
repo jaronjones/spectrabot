@@ -295,11 +295,18 @@ def _git_env(token: str | None) -> dict | None:
     if not token:
         return None
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    # Append after any GIT_CONFIG_* the parent env already set, rather than
+    # assuming index 0 — assuming it would silently drop a caller's injected
+    # git config.
+    try:
+        idx = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        idx = 0
     return {
         **os.environ,
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.extraheader",
-        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+        "GIT_CONFIG_COUNT": str(idx + 1),
+        f"GIT_CONFIG_KEY_{idx}": "http.extraheader",
+        f"GIT_CONFIG_VALUE_{idx}": f"AUTHORIZATION: basic {basic}",
     }
 
 
@@ -546,12 +553,24 @@ def fetch_pr_context(
 # bracket the prompt. `stdin` engines receive the prompt piped on stdin — a
 # large diff exceeds the OS single-argv limit (`MAX_ARG_STRLEN`, 128 KiB), so
 # only `opencode` (no stdin mode — `run` takes the message as argv) keeps the
-# prompt in argv and is therefore capped to small diffs.
+# prompt in argv. An argv prompt over `ARGV_PROMPT_LIMIT` raises
+# `PromptTooLargeError` in `invoke_engine`, which `review_one_pr` turns into
+# the oversized-PR comment rather than letting it crash with `MAX_ARG_STRLEN`.
 ENGINE_SPECS = {
     "claude": {"before": ["-p"], "after": ["--output-format", "text"], "stdin": True},
     "codex": {"before": ["exec"], "after": [], "stdin": True},
     "opencode": {"before": ["run"], "after": [], "stdin": False},
 }
+
+# A single argv element is capped at MAX_ARG_STRLEN (128 KiB on Linux). The
+# prompt for a non-stdin engine occupies one argv slot, so cap it safely below
+# that limit, leaving headroom for the rest of the command line.
+ARGV_PROMPT_LIMIT = 96 * 1024
+
+
+class PromptTooLargeError(RuntimeError):
+    """An argv-only engine was handed a prompt that would exceed the OS
+    single-argument limit. Treated like an oversized PR rather than a crash."""
 
 
 def parse_review_output(text: str) -> dict:
@@ -586,6 +605,12 @@ def invoke_engine(prompt_text: str, pr_meta: dict, diff: str, cfg: dict) -> dict
         cmd = [engine_bin, *spec["before"], *spec["after"], *extra_args]
         stdin_text = user_prompt
     else:
+        prompt_bytes = len(user_prompt.encode())
+        if prompt_bytes > ARGV_PROMPT_LIMIT:
+            raise PromptTooLargeError(
+                f"{name} passes the prompt in argv, but it is {prompt_bytes} "
+                f"bytes — over the {ARGV_PROMPT_LIMIT}-byte safe limit"
+            )
         cmd = [engine_bin, *spec["before"], user_prompt, *spec["after"], *extra_args]
         stdin_text = None
     res = subprocess.run(
@@ -863,12 +888,23 @@ def review_one_pr(
     max_diff = cfg.get("review", {}).get("max_diff_lines", 4000)
     diff_lines = diff.count("\n")
     log(f"  diff: {diff_lines} lines")
-    if max_diff and diff_lines > max_diff:
-        # Too big to review meaningfully in one shot. Rather than failing the
-        # PR (which logs an error and re-attempts every scan), post a one-line
-        # COMMENT and record it in state so it's left alone until the head
-        # advances. verdict "too-large" routes through `previously_reviewed_action`
-        # as a terminal skip-until-rescan.
+    # An oversized PR is too big to review meaningfully in one shot. Rather
+    # than failing the PR (which logs an error and re-attempts every scan),
+    # post a one-line COMMENT and record it in state so it's left alone until
+    # the head advances. verdict "too-large" routes through
+    # `previously_reviewed_action` as a terminal skip-until-rescan.
+    oversized = max_diff and diff_lines > max_diff
+    if oversized:
+        log(f"  diff too large ({diff_lines} > {max_diff} lines) — posting size comment")
+    else:
+        try:
+            review = invoke_engine(prompt_text, meta, diff, cfg)
+        except PromptTooLargeError as e:
+            # An argv-only engine can hit the OS argv limit below max_diff_lines.
+            log(f"  {e} — posting size comment")
+            oversized = True
+
+    if oversized:
         verdict = "too-large"
         event = "COMMENT"
         payload = {
@@ -877,9 +913,7 @@ def review_one_pr(
             "body": OVERSIZED_PR_COMMENT,
             "comments": [],
         }
-        log(f"  diff too large ({diff_lines} > {max_diff} lines) — posting size comment")
     else:
-        review = invoke_engine(prompt_text, meta, diff, cfg)
         mode = cfg.get("review", {}).get("mode", "auto")
         verdict = review.get("recommendation", "comment")
         event = decide_event(verdict, reviewer_login, pr["author"]["login"], mode)
