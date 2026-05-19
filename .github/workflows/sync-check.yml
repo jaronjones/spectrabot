@@ -10,6 +10,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: sync-check-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   sync-check:
     runs-on: ubuntu-latest
@@ -18,15 +22,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Regenerate integration wrappers
-        run: scripts/sync-integrations.sh
+        run: bash scripts/sync-integrations.sh
 
       - name: Fail if wrappers drifted from canonical
         run: |
-          if ! git diff --quiet integrations/; then
+          git add -A integrations/
+          if ! git diff --cached --quiet integrations/; then
             echo "::error::integrations/ is out of sync with pr-review.md."
             echo "Run scripts/sync-integrations.sh and commit the result."
-            git diff --stat integrations/
-            git diff integrations/
+            git diff --cached --stat integrations/
+            git diff --cached integrations/
             exit 1
           fi
           echo "integrations/ is in sync with pr-review.md."
